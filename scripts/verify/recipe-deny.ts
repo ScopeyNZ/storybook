@@ -18,6 +18,11 @@ export const DENY_PATTERNS: ReadonlyArray<readonly [string, RegExp]> = [
   ['import node:', /\bimport\s+['"`]node:/],
   ['require(node:)', /\brequire\s*\(\s*['"`]node:/],
   ['require(child_process)', /\brequire\s*\(\s*['"`]child_process/],
+  // Recipes must import `test` + `expect` from `./_util.ts` (which re-exports
+  // them, augmented with the auto-failure-capture fixture). Importing from
+  // `@playwright/test` directly bypasses the fixture and loses the iframe
+  // snapshot on failure.
+  ['import @playwright/test', /\bfrom\s+['"`]@playwright\/test['"`]/],
 ];
 
 /**

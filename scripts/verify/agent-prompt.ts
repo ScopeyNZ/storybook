@@ -68,7 +68,7 @@ export function buildRecipeAuthorPrompt(input: PromptInput): string {
       '',
       `Hard requirements:`,
       `- One file, one \`test(...)\` call. No \`describe\`, no \`test.only\`, no \`test.skip\`, no \`beforeEach\`/\`afterEach\`.`,
-      `- Imports allowed: \`@playwright/test\` and \`./_util.ts\` only. Nothing else.`,
+      `- Imports allowed: \`./_util.ts\` only — it re-exports \`expect\` + a \`test\` extended with the harness's auto-failure-capture fixture (dumps the preview iframe a11y snapshot to \`iframe-snapshot.md\` so the retry loop can feed it back). Do NOT import \`test\` or \`expect\` directly from \`@playwright/test\`; the deny-regex rejects that.`,
       `- Use the \`.ts\` extension on the relative import (\`./_util.ts\`).`,
       `- Listeners (\`page.on('pageerror', ...)\` and \`page.on('console', ...)\`) MUST be registered BEFORE the first \`page.goto(...)\`.`,
       `- Both \`testInfo.attach('pageErrors', ...)\` and \`testInfo.attach('consoleErrors', ...)\` MUST appear in a \`finally\` block.`,

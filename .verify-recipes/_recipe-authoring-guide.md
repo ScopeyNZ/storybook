@@ -13,9 +13,7 @@ Emit **one file** at the path specified by the skill: `.verify-recipes/pr-<#>.sp
 Required shape:
 
 ```ts
-import { expect, test } from '@playwright/test';
-
-import { RecipePage } from './_util.ts';
+import { RecipePage, expect, test } from './_util.ts';
 
 test('<short imperative description>', async ({ page }, testInfo) => {
   // ... see rules below ...
@@ -24,7 +22,7 @@ test('<short imperative description>', async ({ page }, testInfo) => {
 
 Hard requirements:
 
-- **Imports**: ONLY `@playwright/test` and `./_util.ts`. Nothing else. No `node:*`, no `child_process`, no `fs`, no `@storybook/*`, no relative imports outside `.verify-recipes/`.
+- **Imports**: ONLY `./_util.ts` (which re-exports `expect` + a `test` extended with the harness's auto-failure-capture fixture — captures the preview iframe accessibility snapshot to `iframe-snapshot.md` so the retry loop can feed it back to the next author dispatch). Nothing else. No `node:*`, no `child_process`, no `fs`, no `@storybook/*`, no relative imports outside `.verify-recipes/`. Do not import `test` or `expect` directly from `@playwright/test`; that bypasses the failure-capture fixture.
 - **Exactly one `test(...)` call.** No `describe`, no `test.skip`, no `test.only`, no `beforeEach`/`afterEach`.
 - **`.ts` extension on relative imports** (`./_util.ts`, not `./_util`).
 - **No top-level side effects** — everything inside the `test(...)` callback.
@@ -131,7 +129,11 @@ Avoid:
 - Docs: `?path=/docs/<kind-id>--<story-id>` (e.g., `/?path=/docs/example-button--docs`)
 - Manager only (no story): omit the `path` param or use `?path=/`
 
-Kind-ids are kebab-case from the story `title` field; story-ids are kebab-case from the export name. When the PR diff names a `*.stories.tsx` file, derive the kind-id from the file path or the `title:` line in the diff.
+**Use the routes the harness pre-computes for you.** The prompt bundle contains a "Story routes (computed deterministically by the harness)" section that lists, for each `*.stories.{ts,tsx,mdx}` file referenced by the diff (or imported by a sibling of a touched non-stories source file), the canonical title, the per-export `storyId`, and the matching `storyUrl` / `docsUrl`. These come from Storybook's own auto-title + `toId` algorithms, so they match what the indexer would emit at runtime.
+
+Past dispatches that hand-derived kebab-case kind-ids (`addons-controls-object--basic`, `addons-controls-basics--docs`, …) have 404'd because Storybook's auto-title pipeline mangles paths differently than a naive kebabify (leaf/dir dedupe, `index.stories.ts` collapsing, `titlePrefix` interplay, etc). Always prefer the routes the harness emits.
+
+If the section is absent (because the diff doesn't touch any code under `code/` or because no sibling story imports the changed module), fall back to the manager-only route `?path=/` and rely on sidebar-driven navigation. Do not invent a URL.
 
 ---
 
@@ -170,6 +172,100 @@ A **targeted recipe** goes further. Examples per change type:
 | `code/builders/**` | Assert preview-iframe loads at all (builder errors surface here); navigate to a story; confirm HMR not needed for static load |
 
 Pick the assertion shape that most directly observes the changed code path. Prefer 1-3 focused assertions over a long list — the runner harvests pageerrors/consoleerrors orthogonally.
+
+---
+
+## 8.1 Evidence requirement (HARD GATE for single-round CI)
+
+In single-round CI mode the assertions + screenshots ARE the evidence the harness reports as "verified". A smoke recipe that asserts unrelated story behaviour is technically passable but **does not verify the diff** — the PR comment will mislead reviewers. Treat this section as a hard authoring gate.
+
+Before emitting the spec, work through the following four questions explicitly:
+
+1. **What does this PR visibly or behaviourally change?** Read the diff carefully. Icon swap, text change, conditional render branch, focus / hover / dark-mode state, addon panel content, sidebar tree, URL params, computed style — all qualify.
+2. **What UI state is required to see the change?** Common gates:
+   - **Conditional render** — e.g. `if (newCount === 0 && modifiedCount === 0) return null`. The element only mounts when its predicate is true. Identify the predicate's inputs and either set them via `page.evaluate(...)` against the manager-api / universal store, set localStorage / sessionStorage keys, or navigate to a route that produces the required state.
+   - **Feature flags** — `globalThis.FEATURES.changeDetection` and similar flags are **enabled by default** in the internal-ui Storybook. The diff itself is the only authoritative source for whether a new flag must be set.
+   - **Theme / dark-mode** — pass `?globals=theme:dark` in the URL or set the theme via `manager-api` once the manager mounts.
+   - **Focus / hover / keyboard-only states** — use `.focus()`, `.hover()`, `page.keyboard.press('Tab')`. Many a11y-related PRs only render their change in these states.
+   - **Specific story route** — when the diff names a specific component, navigate to the story that mounts it, not the generic `example-button--primary`.
+3. **Before deciding the trigger state is unreachable, walk through every affordance listed in the next subsection.** For each one, decide whether it applies to this diff. Most "I can't do this without `fs.*`" assumptions turn out to be wrong because Storybook's own in-app machinery exposes a path: Save from Controls writes story files via csf-tools, `page.evaluate` reaches manager-api setters, URL globals flip theme/args, and so on. **Only after explicitly considering each affordance and rejecting it with a one-sentence reason** may you fall back to: render the surrounding container, assert `#sb-errordisplay` is hidden, assert `expect(pageErrors).toEqual([])`. The bare phrase "working-tree mutation required" is **not** a valid fallback justification — Save from Controls satisfies that exact need without ever touching `fs.*`. The fallback is reserved for cases where (a) the diff is non-visual at all (pure type/logic refactor), or (b) the visible effect depends on env state outside the runner's reach. Either way, state the rejected affordances in the spec comment so a reviewer can audit the reasoning.
+4. **Screenshot the region containing the changed UI**, not the whole page. Use `locator.screenshot({ path: testInfo.outputPath('<name>.png') })` against the parent of the changed element (e.g. `.sidebar-container` for sidebar diffs, the addon-panel locator for addon panels, the docs `[role="table"]` for ArgsTable changes). Full-page or generic preview screenshots are acceptable only for layout-wide changes. The PR comment renders every screenshot you attach inline — reviewers should see the change in the image.
+
+### Affordances Playwright recipes have for setting up trigger state
+
+The deny-regex blocks `fs.*` and `child_process` inside the spec body. That does **not** mean the test cannot reach state that lives on disk — Storybook's own in-app machinery exposes plenty of paths. Before declaring a trigger state unreachable, consider:
+
+- **URL params for navigation, theme, args, globals, and docs vs story modes.**
+  - `?path=/story/<kind-id>--<story-id>` and `?path=/docs/<kind-id>--<story-id>` for story / docs routes.
+  - `?globals=theme:dark` (or whatever global the renderer exposes) to flip dark-mode and other globals without clicking the toolbar.
+  - `?args=name:Hello` to seed initial arg values for a story.
+- **`page.evaluate(...)` against the manager-api.** Storybook exposes its manager-api on `window` once the manager mounts — useful when a feature has a public toggle / setter that recipes can call directly. Inspect the diff for an `experimental_*` or `api.*` setter the change relies on and call it from the recipe.
+- **Save from Controls (csf-tools write-back) for change-detection-style features.** The Controls addon's save button is enabled by default. The recipe opens a story (e.g. `example-button--primary`), clicks the Controls tab (`getByRole('tab', { name: /controls/i })`), edits a control value (e.g. the `label` input), and clicks **`Save changes to story`** (aria-label) / **`Update story`** (visible text) — i.e. `getByRole('button', { name: /save changes to story|update story/i })`. Storybook's csf-tools writes the modified args back to the underlying `*.stories.tsx` file on the runner's PR-head workspace. The change-detection scanner reads uncommitted working-tree state, so the Save-driven edit flips the story's status to MOD and surfaces change-detection UI (e.g. `ReviewChangesButton`'s clear button) in the sidebar. The recipe never touches `fs.*` directly — Storybook does the write.
+- **Keyboard / focus / hover.** `.focus()`, `.hover()`, `page.keyboard.press('Tab')`, `page.keyboard.press('Escape')`. Many a11y / interaction PRs only render their change in these states.
+- **localStorage / sessionStorage / cookies.** Read or write via `page.evaluate(...)` when the change depends on persisted UI state (e.g. sidebar collapse, recently-viewed list).
+- **Manager-side state via `__STORYBOOK_*` globals.** When the diff touches preview-api or manager-api code that exposes a development hook on `globalThis`, prefer `page.evaluate(() => globalThis.__STORYBOOK_*…)` over reverse-engineering a click sequence.
+
+Only fall back to the §8.1.3 "trigger state is genuinely unreachable" path after walking through the affordances above and confirming none apply to the diff at hand. If none apply, say so explicitly in a single-line comment in the spec body and limit the assertions to module-resolution + pageerror — the harness's evidence-check will report the gap honestly to reviewers.
+
+### Worked example — focus ring on a selected sidebar item
+
+```ts
+await page.goto(`${baseURL}/?path=/story/example-button--primary`);
+await new RecipePage(page, expect).waitUntilLoaded();
+
+const selected = page.locator(
+  '[data-item-id="example-button--primary"][data-selected="true"]',
+);
+await selected.focus(); // trigger the focus-ring state
+
+await expect(selected).toHaveCSS('box-shadow', /inset.+2px/i);
+
+// Screenshot the sidebar region — the focus ring is visible here:
+await page.locator('.sidebar-container').screenshot({
+  path: testInfo.outputPath('sidebar-focus-ring.png'),
+});
+```
+
+### Worked example — icon swap inside a conditionally-rendered, change-detection-gated button
+
+`ReviewChangesButton` (and its clear button containing the icon under test) only renders when at least one story has status NEW or MOD. We use **Save from Controls** to mutate a story file on the working tree; the change-detection scanner picks the uncommitted edit up and flips the story's status, which causes `ReviewChangesButton` to mount. The recipe never calls `fs.*` directly — Storybook's csf-tools does the write.
+
+```ts
+await page.goto(`${baseURL}/?path=/story/example-button--primary`);
+const recipe = new RecipePage(page, expect);
+await recipe.waitUntilLoaded();
+
+// 1. Open the Controls panel and edit a control value.
+const controlsTab = page.getByRole('tab', { name: /controls/i });
+await controlsTab.click();
+const labelInput = page.locator('input[name="label"], textarea[name="label"]').first();
+await labelInput.fill('Verify harness saved this');
+
+// 2. Save from Controls — csf-tools writes the edit back to the story file on
+//    the runner's working tree. The button in this Storybook is
+//    aria-labelled "Save changes to story" with visible text "Update story";
+//    match on either to stay robust across label drift.
+const saveButton = page.getByRole('button', { name: /save changes to story|update story/i });
+await expect(saveButton).toBeVisible({ timeout: 10000 });
+await saveButton.click();
+
+// 3. Change-detection now sees the story as MOD; the review toggle mounts.
+//    NOTE: it is rendered as an aria `switch`, NOT a `button`. Match accordingly.
+const reviewToggle = page.getByRole('switch', { name: /review.+stories/i });
+await expect(reviewToggle).toBeVisible({ timeout: 15000 });
+
+// 4. Activate review mode so the *clear* button (which carries the diff's icon) renders.
+await reviewToggle.click();
+const clearButton = page.getByRole('button', { name: /^clear$/i });
+await expect(clearButton).toBeVisible({ timeout: 10000 });
+
+// 5. Screenshot the sidebar region — the new UndoIcon is inside the clear button.
+await page.locator('.sidebar-container').screenshot({
+  path: testInfo.outputPath('sidebar-with-clear-button.png'),
+});
+```
+
+This pattern (Save from Controls → wait for status flip → screenshot the now-visible UI) is the canonical answer for any diff that touches change-detection-gated UI. The closing `expect(pageErrors).toEqual([])` in the standard footer covers module-resolution as a free bonus.
 
 ---
 
@@ -215,12 +311,23 @@ the **first non-empty line** of the spec:
 | Target | What the harness boots | Pick when |
 |---|---|---|
 | `internal-ui` (default if header absent) | `code/storybook-static/` served via `http-server`. Built once from the PR-head monorepo. | The diff touches a package that the internal Storybook UI exercises (manager, manager-api, channels, core-server, addons, csf-tools, preview-api). This is the right answer for ~all PRs. |
-| `sandbox:<template>` | `yarn task sandbox --template <template>` + `code/core/dist` symlinked into the sandbox's `node_modules/storybook`. | The diff is template-specific (frameworks/builders/renderers) AND the regression is only reproducible inside a generated sandbox. Rare. |
+| `sandbox:<template>` | `yarn task sandbox --template <template>` + `code/core/dist` symlinked into the sandbox's `node_modules/storybook`. | The diff is template-specific (frameworks/builders/renderers) AND the regression is only reproducible inside a generated sandbox. |
+
+**Strong sandbox-target signals (pick `sandbox:<template>` when):**
+- Diff touches `code/renderers/<r>/template/cli/**` or `code/frameworks/<r>/template/cli/**` — these files only exist inside generated sandboxes; internal-ui never imports them.
+- Diff touches build/runtime code of a non-react renderer or framework (`code/renderers/vue3/src/**`, `code/frameworks/svelte-vite/src/**`, `code/frameworks/nextjs/src/**`, …) where internal-ui has no equivalent story.
+
+Pick the matching template:
+- `code/renderers/vue3/**` or `code/frameworks/vue3-vite/**` → `sandbox:vue3-vite/default-ts`
+- `code/renderers/svelte/**` or `code/frameworks/svelte-vite/**` → `sandbox:svelte-vite/default-ts`
+- `code/frameworks/nextjs/**` → `sandbox:nextjs/default-ts`
+- `code/renderers/react/**` only when internal-ui can't reach the change → `sandbox:react-vite/default-ts`
 
 If you choose `sandbox:<template>`, use a template the repo lists in
-`code/lib/cli-storybook/src/sandbox-templates.ts` — typically
+`code/lib/cli-storybook/src/sandbox-templates.ts`. The workflow allowlists:
 `react-vite/default-ts`, `react-webpack/default-ts`,
-`vue3-vite/default-ts`, or `nextjs/default-ts`.
+`vue3-vite/default-ts`, `svelte-vite/default-ts`,
+`angular-cli/default-ts`, `nextjs/default-ts`.
 
 The header must appear before the first `import` statement. The
 parser scans the first 30 lines; an absent or unrecognised header

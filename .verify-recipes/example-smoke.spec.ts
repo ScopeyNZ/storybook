@@ -1,7 +1,5 @@
 // @verify-target: internal-ui
-import { expect, test } from '@playwright/test';
-
-import { RecipePage } from './_util.ts';
+import { RecipePage, expect, test } from './_util.ts';
 
 test('example-button--primary renders without runtime errors', async ({ page }, testInfo) => {
   const pageErrors: string[] = [];

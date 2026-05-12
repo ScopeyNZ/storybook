@@ -4,9 +4,7 @@ import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import * as path from 'node:path';
 
-export function resolveSandboxDir(
-  template: 'react-vite/default-ts' = 'react-vite/default-ts'
-): string {
+export function resolveSandboxDir(template: string = 'react-vite/default-ts'): string {
   const repoRoot = path.resolve(import.meta.dirname, '..', '..');
   const sandboxKey = template.replace('/', '-');
   const envOverride = process.env.STORYBOOK_SANDBOX_ROOT;

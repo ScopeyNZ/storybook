@@ -109,6 +109,99 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
+      - name: Sync trusted .verify-recipes helpers into PR head
+        # The authored spec imports `./_util.ts` (which re-exports `expect`
+        # + a `test` extended with the auto-failure-capture fixture). The
+        # PR-head checkout has a copy of `_util.ts` at the SHA the PR
+        # branched from, which lags behind the base branch's harness
+        # iteration. Always overwrite with the base-branch version so the
+        # spec runs against the current util contract. example-smoke.spec.ts
+        # is copied alongside so reference recipes stay aligned.
+        run: |
+          set -euo pipefail
+          mkdir -p "$PR_HEAD_DIR/.verify-recipes"
+          cp .verify-recipes/_util.ts "$PR_HEAD_DIR/.verify-recipes/_util.ts"
+          cp .verify-recipes/example-smoke.spec.ts "$PR_HEAD_DIR/.verify-recipes/example-smoke.spec.ts"
+
+      - name: Install sandbox-runtime (Layer-2)
+        # Layer-2 defense-in-depth: wrap `yarn verify-pr` (the only step that
+        # executes the agent-emitted Playwright spec from untrusted PR-head
+        # code) in @anthropic-ai/sandbox-runtime. bubblewrap-backed FS +
+        # network jail so a compromised recipe can't reach ~/.ssh, ~/.aws,
+        # ~/.npmrc, or the public internet. Layer-1 already strips creds
+        # from env; Layer-2 catches anything that survives env-stripping
+        # plus tightens the FS attack surface.
+        #
+        # ubuntu-22.04 has unprivileged user namespaces enabled by default,
+        # which bubblewrap requires. ubuntu-24.04+ would need
+        # `sysctl kernel.apparmor_restrict_unprivileged_userns=0`.
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends bubblewrap socat ripgrep
+          sudo npm install -g @anthropic-ai/sandbox-runtime
+          srt --version
+
+      - name: Build sandbox settings
+        # Linux srt requires literal paths (no glob, no env var expansion).
+        # Compose the settings file at runtime so $RUNNER_TEMP / $HOME
+        # resolve to the runner's actual paths. denyRead the high-value
+        # credential targets even though default reads are allow (extra
+        # belt-and-suspenders alongside Layer-1's env stripping). allowWrite
+        # covers RUNNER_TEMP (contains PR_HEAD_DIR + .verify-output),
+        # $SANDBOX_TMPDIR (TMPDIR override, see below), and HOME/.cache
+        # (playwright binary cache writes during browser launch).
+        #
+        # CLAUDE_CODE_TMPDIR: srt sets TMPDIR=/tmp/claude inside the
+        # sandbox by default (see anthropic-experimental/sandbox-runtime
+        # src/sandbox/sandbox-utils.ts L320-325). It then `--bind`s host
+        # paths into the sandbox at the same paths — but bwrap doesn't
+        # auto-create them, so if /tmp/claude doesn't exist on the host,
+        # yarn's mktempPromise crashes with ENOENT. Override with a path
+        # under RUNNER_TEMP we pre-create and that's already in allowWrite.
+        run: |
+          set -euo pipefail
+          SANDBOX_TMPDIR="$RUNNER_TEMP/sandbox-tmp"
+          mkdir -p "$SANDBOX_TMPDIR"
+          # bwrap --bind requires the host source to exist. Pre-create
+          # $HOME/.storybook so Storybook's global settings writes
+          # (~/.storybook/settings.json) don't EROFS inside the sandbox.
+          # Note this is the GLOBAL user-prefs file; workspace .storybook
+          # at $PR_HEAD_DIR/code/.storybook is already covered by the
+          # $RUNNER_TEMP allowWrite entry.
+          mkdir -p "$HOME/.storybook"
+          cat > "$RUNNER_TEMP/srt-settings.json" <<JSON
+          {
+            "network": {
+              "allowLocalBinding": true,
+              "allowedDomains": [],
+              "deniedDomains": []
+            },
+            "filesystem": {
+              "allowRead": [],
+              "allowWrite": [
+                "$RUNNER_TEMP",
+                "/tmp",
+                "$HOME/.cache",
+                "$HOME/.local/share",
+                "$HOME/.storybook"
+              ],
+              "denyRead": [
+                "$HOME/.ssh",
+                "$HOME/.aws",
+                "$HOME/.docker",
+                "$HOME/.npmrc",
+                "$HOME/.gitconfig",
+                "$HOME/.config/gh"
+              ],
+              "denyWrite": []
+            }
+          }
+          JSON
+          echo "SRT_SETTINGS=$RUNNER_TEMP/srt-settings.json" >> "$GITHUB_ENV"
+          echo "CLAUDE_CODE_TMPDIR=$SANDBOX_TMPDIR" >> "$GITHUB_ENV"
+          cat "$RUNNER_TEMP/srt-settings.json"
+
       - name: Verify PR
         working-directory: ${{ runner.temp }}/pr-head
         env:
@@ -121,23 +214,387 @@ jobs:
           NX_CLOUD_ACCESS_TOKEN: ''
         run: |
           set -euo pipefail
+          # Layer-1 security: drop secrets from the env before invoking any
+          # PR-head script. `pull_request_target` runs build / sandbox /
+          # recipe code from the untrusted PR head as the same runner user
+          # that holds GITHUB_TOKEN (contents:write, pull-requests:write,
+          # screenshots-branch push) and the (already step-scoped)
+          # ANTHROPIC_API_KEY. A compromised build script or agent-emitted
+          # recipe could otherwise exfil them. This step doesn't need any
+          # of these secrets — compile + verify-pr only touch localhost +
+          # the PR-head workspace.
+          unset GITHUB_TOKEN GH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
           yarn install --immutable
           # Install the Playwright chromium browser binary on the runner
           # (the GitHub-hosted ubuntu-22.04 image does not pre-bundle
           # @playwright/test browsers).
           yarn playwright install --with-deps chromium
-          # Compile core FIRST so eslint-plugin's prebuild script (which
-          # imports from `storybook/csf` via jiti) can resolve
-          # `storybook/dist/csf/index.js`. nx run-many parallelises by
-          # default and does not topo-order compile targets unless an
-          # explicit `dependsOn: ["^compile"]` is set, which the repo
-          # currently lacks for the eslint-plugin chain.
-          yarn nx compile core
-          # Then compile every other NX project so the internal-ui dev
-          # server can resolve @storybook/react-vite + every addon
-          # listed in code/.storybook/main.ts.
-          yarn nx run-many -t compile
-          yarn verify-pr --recipe-spec ".verify-recipes/pr-${PR_NUMBER}.spec.ts"
+
+          # Stub a regression verdict if compile fails. Without this, the
+          # workflow short-circuits before verify-result.json is written and
+          # the PR comment shows "No verdict produced" — confusing for cases
+          # like PR #15 where the upstream PR genuinely doesn't compile.
+          # The stub captures the tail of the compile output as
+          # regressionReason so reviewers see WHY the verdict is regression.
+          write_compile_failure_stub() {
+            local log="$1"
+            local run_id
+            run_id="$(date -u +%Y-%m-%dT%H-%M-%S.000Z)"
+            local out_dir=".verify-output/${run_id}"
+            mkdir -p "$out_dir"
+            local reason
+            # Strip ANSI escape sequences (CSI / SGR) so the PR comment shows
+            # readable text rather than `^[[31m`-style noise.
+            reason="$(tail -c 4000 "$log" | tr -d '\000' | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' | jq -Rs .)"
+            jq -n \
+              --arg runId "$run_id" \
+              --arg template "internal-ui" \
+              --argjson reason "$reason" \
+              '{
+                schemaVersion: 1,
+                runId: $runId,
+                verdict: "regression",
+                template: $template,
+                regressionReason: "compile failure (see regressionDetails)",
+                regressionDetails: $reason,
+                storyIds: [],
+                recipeSpecPath: "",
+                tests: [],
+                traceZipPaths: [],
+                durations: {},
+                createdAt: (now | todate)
+              }' > "$out_dir/verify-result.json"
+            echo "[verify] compile failure — wrote stub verdict to $out_dir/verify-result.json"
+          }
+          COMPILE_LOG="$RUNNER_TEMP/verify-compile.log"
+          # Pick the prep path based on the recipe's @verify-target header.
+          # internal-ui: needs `nx compile core` (so `code/core/dist/bin/
+          # dispatcher.js` exists for bootInternalUi) plus the rest of the
+          # workspace compiled so the dev server can resolve every addon /
+          # framework `code/.storybook/main.ts` imports.
+          # sandbox:<tpl>: `nx run <tpl>:sandbox` handles all compile deps
+          # via the project's implicitDependencies + emits the sandbox dir
+          # at `code/sandbox/<key>` (verify-pr's resolveSandboxDir checks
+          # this path before falling through to `../storybook-sandboxes`).
+          # `yarn task sandbox` is the legacy wrapper that re-runs the
+          # global `compile` target before invoking `:sandbox`, so it
+          # double-compiles for no benefit on CI — drop it.
+          SPEC=".verify-recipes/pr-${PR_NUMBER}.spec.ts"
+          TARGET="internal-ui"
+          TEMPLATE=""
+          if [ -f "$SPEC" ]; then
+            HEADER=$(grep -E '^// @verify-target:' "$SPEC" | head -1 || true)
+            CANDIDATE=$(echo "$HEADER" | sed -E 's|.*@verify-target:[[:space:]]*||;s|[[:space:]]+$||')
+            case "$CANDIDATE" in
+              sandbox:*)
+                TEMPLATE="${CANDIDATE#sandbox:}"
+                case "$TEMPLATE" in
+                  react-vite/default-ts|react-webpack/default-ts|vue3-vite/default-ts|svelte-vite/default-ts|angular-cli/default-ts|nextjs/default-ts|nextjs-vite/default-ts)
+                    TARGET="sandbox"
+                    ;;
+                  *)
+                    echo "[verify] sandbox template '$TEMPLATE' is not allowlisted; falling back to internal-ui prep (verify-pr will still emit a clear error)."
+                    TEMPLATE=""
+                    ;;
+                esac
+                ;;
+            esac
+          fi
+
+          if [ "$TARGET" = "sandbox" ]; then
+            echo "[verify] spec targets sandbox '$TEMPLATE' — running 'nx run $TEMPLATE:sandbox'"
+            # The `:sandbox` target resolves implicitDependencies (core,
+            # cli, addons, the framework package) and generates the
+            # sandbox project under code/sandbox/<key>. No extra
+            # `nx compile core` / `run-many` needed — nx topo-orders deps
+            # itself.
+            if ! yarn nx run "$TEMPLATE:sandbox" 2>&1 | tee "$COMPILE_LOG"; then
+              write_compile_failure_stub "$COMPILE_LOG"
+              exit 0
+            fi
+          else
+            # internal-ui path. Compile core first (eslint-plugin's
+            # prebuild script imports `storybook/csf` via jiti and needs
+            # `storybook/dist/csf/index.js` to resolve; nx run-many does
+            # not topo-order this unless `dependsOn: ["^compile"]` is set,
+            # which the repo currently lacks for the eslint-plugin chain).
+            if ! yarn nx compile core 2>&1 | tee "$COMPILE_LOG"; then
+              write_compile_failure_stub "$COMPILE_LOG"
+              exit 0
+            fi
+            # Then compile every other NX project so the internal-ui dev
+            # server can resolve @storybook/react-vite + every addon
+            # listed in code/.storybook/main.ts.
+            if ! yarn nx run-many -t compile 2>&1 | tee "$COMPILE_LOG"; then
+              write_compile_failure_stub "$COMPILE_LOG"
+              exit 0
+            fi
+          fi
+
+          # Swallow non-zero exit so downstream Evidence-check / Retry steps
+          # always run. Final verdict gate at end of job ("Fail job if final
+          # verdict is regression") preserves red-CI signal based on the
+          # post-retry verdict in verify-result.json.
+          # Layer-2: srt wraps just this invocation — install + compile
+          # above legitimately need full FS + network for yarn registries +
+          # node_modules writes, so they run outside the sandbox.
+          srt --settings "$SRT_SETTINGS" \
+            yarn verify-pr --recipe-spec ".verify-recipes/pr-${PR_NUMBER}.spec.ts" || \
+            echo "verify-pr exited non-zero — verdict captured in verify-result.json"
+
+      - name: Evidence check (vision)
+        # Runs only when the initial verdict was 'verified'. ANTHROPIC_API_KEY
+        # is mounted scoped to THIS step only. The script does not execute
+        # LLM-generated code; it submits the diff + authored spec + screenshot
+        # images to claude-haiku-4-5 and rewrites verify-result.json with
+        # {evidenceVerdict, evidenceReasoning, evidenceModel}. If evidence is
+        # 'missing' or 'undetermined', final verdict is rewritten to
+        # 'evidence-missing'; the Retry step below picks it up. Regression
+        # verdicts skip evidence-check and go straight to Retry with
+        # error-context.md as feedback.
+        if: always()
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if ! compgen -G "$PR_HEAD_DIR/.verify-output/*/verify-result.json" >/dev/null; then
+            echo "no verify-result.json — skipping evidence check"
+            exit 0
+          fi
+          # shellcheck disable=SC2012
+          RESULT=$(ls -t "$PR_HEAD_DIR"/.verify-output/*/verify-result.json | head -1)
+          VERDICT=$(jq -r '.verdict' "$RESULT")
+          if [ "$VERDICT" != "verified" ]; then
+            echo "verdict is '$VERDICT' — skipping evidence check (retry will use Playwright error context)"
+            exit 0
+          fi
+          RECIPE="$PR_HEAD_DIR/.verify-recipes/pr-${PR_NUMBER}.spec.ts"
+          yarn verify-evidence-check \
+            --result "$RESULT" \
+            --diff /tmp/pr.diff \
+            --recipe "$RECIPE"
+
+      - name: Retry on regression or evidence missing/undetermined
+        # Single retry when prior attempt's verdict was 'regression' OR
+        # evidence verdict was 'missing'/'undetermined'. Feedback fed back
+        # via --retry-context:
+        #   - regression: error-context.md (page snapshot) + Playwright error
+        #     text from playwright-report.json. Gives the author ground-truth
+        #     DOM names / route paths so it can self-correct selectors.
+        #   - evidence missing/undetermined: vision reasoning from
+        #     evidence-check.
+        # The author re-dispatches under a scoped API key. The retried
+        # recipe is materialised at the same PR-head path (overwriting the
+        # prior attempt). verify-pr re-runs (no recompile — runner already
+        # has the compiled monorepo). Evidence-check re-runs on the new
+        # result if it produced a 'verified' verdict.
+        #
+        # Max 1 retry. Author/evidence failures during retry are tolerated
+        # so the original attempt's verdict still surfaces in the PR comment.
+        if: always()
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          NX_NO_CLOUD: 'true'
+          NX_CLOUD_ACCESS_TOKEN: ''
+        run: |
+          set -euo pipefail
+          if ! compgen -G "$PR_HEAD_DIR/.verify-output/*/verify-result.json" >/dev/null; then
+            echo "no verify-result.json — skipping retry"
+            exit 0
+          fi
+          # shellcheck disable=SC2012
+          RESULT=$(ls -t "$PR_HEAD_DIR"/.verify-output/*/verify-result.json | head -1)
+          VERDICT=$(jq -r '.verdict' "$RESULT")
+          EVIDENCE=$(jq -r '.evidenceVerdict // "n/a"' "$RESULT")
+          RUN_DIR=$(dirname "$RESULT")
+
+          REASON=""
+          case "$VERDICT" in
+            regression)
+              # Collect page snapshots + Playwright error text from each
+              # failed test directory. The page snapshot is ground truth for
+              # selectors / route discovery; clip at 8 KB per file to keep
+              # the retry prompt bounded.
+              ERROR_CTX=""
+              for f in "$RUN_DIR"/*/error-context.md; do
+                [ -f "$f" ] || continue
+                SLUG=$(basename "$(dirname "$f")")
+                ERROR_CTX+=$'\n\n--- page snapshot at failure ('"$SLUG"$') ---\n'
+                ERROR_CTX+=$(head -c 8000 "$f")
+                # Pair the manager page snapshot with the preview iframe a11y
+                # snapshot (when the failure-capture fixture wrote one). The
+                # iframe snapshot is the only DOM the agent's preview locators
+                # actually inspect; without it the agent can't tell why the
+                # locator timed out.
+                IF="$(dirname "$f")/iframe-snapshot.md"
+                if [ -f "$IF" ]; then
+                  ERROR_CTX+=$'\n\n--- preview iframe snapshot at failure ('"$SLUG"$') ---\n'
+                  ERROR_CTX+=$(head -c 8000 "$IF")
+                fi
+              done
+              # Pull the test's error message + stack from playwright-report.json
+              # if available. Use --raw-output and tolerate absence.
+              REPORT="$RUN_DIR/playwright-report.json"
+              ERROR_MSG=""
+              if [ -f "$REPORT" ]; then
+                ERROR_MSG=$(jq -r '
+                  [.. | objects | select(has("errors")) | .errors[]? | (.message // .stack // tostring)] | .[0] // ""
+                ' "$REPORT" 2>/dev/null || true)
+              fi
+              REASON="Playwright assertions failed. The recipe ran but the test did not pass. Use the page snapshot below as ground truth for selectors / route paths / aria roles — if you navigated to a route that does not exist, the snapshot will say so; if a locator timed out, the actual DOM is in the snapshot. Adjust selectors / navigation accordingly. Do NOT repeat the previous attempt's selectors or routes verbatim."
+              if [ -n "$ERROR_MSG" ]; then
+                REASON+=$'\n\nFirst Playwright error:\n'"$ERROR_MSG"
+              fi
+              REASON+="$ERROR_CTX"
+              echo "regression — retrying with error context (length=${#REASON})"
+              ;;
+            *)
+              if [ "$EVIDENCE" != "missing" ] && [ "$EVIDENCE" != "undetermined" ]; then
+                echo "verdict=$VERDICT evidence=$EVIDENCE — no retry needed"
+                exit 0
+              fi
+              REASON=$(jq -r '.evidenceReasoning // ""' "$RESULT")
+              echo "evidence $EVIDENCE — retrying with vision reasoning"
+              ;;
+          esac
+
+          if ! yarn verify-pr-generate \
+              --pr "$PR_NUMBER" \
+              --force \
+              --output "$PR_HEAD_DIR/.verify-recipes/pr-${PR_NUMBER}.spec.ts" \
+              --retry-context "$REASON"; then
+            echo "retry verify-pr-generate failed — keeping original verdict"
+            exit 0
+          fi
+
+          # shellcheck disable=SC2012
+          BUNDLE=$(ls -t .verify-output/*/prompt-bundle.json | head -1)
+          if ! yarn verify-pr-author --bundle "$BUNDLE"; then
+            echo "retry verify-pr-author failed — keeping original verdict"
+            exit 0
+          fi
+
+          # Sub-shell so set -e here doesn't kill the outer step on regression.
+          # Strip secrets from env: this invocation runs the agent-emitted
+          # spec (untrusted), so GITHUB_TOKEN / GH_TOKEN / ANTHROPIC_API_KEY
+          # must not be visible to the subprocess. The trusted scripts
+          # above (verify-pr-generate, verify-pr-author) still see them
+          # because env -u only strips for this single command. srt wraps
+          # the actual recipe execution for Layer-2 FS + network jail.
+          ( cd "$PR_HEAD_DIR" && env -u GITHUB_TOKEN -u GH_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
+              srt --settings "$SRT_SETTINGS" \
+              yarn verify-pr --recipe-spec ".verify-recipes/pr-${PR_NUMBER}.spec.ts" ) || \
+            echo "retry verify-pr exited non-zero — evidence-check will still run if verdict==verified"
+
+          # shellcheck disable=SC2012
+          NEW_RESULT=$(ls -t "$PR_HEAD_DIR"/.verify-output/*/verify-result.json | head -1)
+          if [ "$NEW_RESULT" = "$RESULT" ]; then
+            echo "retry produced no new verify-result.json — keeping original verdict"
+            exit 0
+          fi
+          # Annotate the new result so downstream observers know this came
+          # from the retry loop.
+          jq '. + {evidenceRetry: true}' "$NEW_RESULT" > "$NEW_RESULT.tmp" && mv "$NEW_RESULT.tmp" "$NEW_RESULT"
+
+          # Evidence-check only meaningful on a verified verdict; on
+          # regression the screenshots typically don't capture the change.
+          NEW_VERDICT=$(jq -r '.verdict' "$NEW_RESULT")
+          if [ "$NEW_VERDICT" = "verified" ]; then
+            yarn verify-evidence-check \
+              --result "$NEW_RESULT" \
+              --diff /tmp/pr.diff \
+              --recipe "$PR_HEAD_DIR/.verify-recipes/pr-${PR_NUMBER}.spec.ts" || true
+          fi
+
+          FINAL_EVIDENCE=$(jq -r '.evidenceVerdict // "n/a"' "$NEW_RESULT")
+          echo "retry complete — final verdict=$NEW_VERDICT evidence=$FINAL_EVIDENCE"
+
+      - name: Run PR-added unit tests
+        # Complementary verification signal: when the PR ships its own
+        # *.test.{ts,tsx,…} alongside the diff (e.g. PR #16 added
+        # HighlightStyles.test.tsx), run them via vitest. Result is folded
+        # into verify-result.json under `unitTests` — Playwright + unit
+        # tests together give reviewers AND/OR confidence the diff works.
+        # This step does NOT change the existing verdict; the comment
+        # renders unit-test status alongside the Playwright verdict so
+        # they're visible together. A regression in unit tests but a
+        # verified Playwright recipe (or vice versa) is informative on
+        # its own.
+        if: always()
+        working-directory: ${{ runner.temp }}/pr-head
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          NX_NO_CLOUD: 'true'
+          NX_CLOUD_ACCESS_TOKEN: ''
+        run: |
+          set -euo pipefail
+          # Layer-1 security: PR-added test files are agent / contributor
+          # content, untrusted under pull_request_target. Strip secrets so
+          # a malicious test file can't read GITHUB_TOKEN /
+          # ANTHROPIC_API_KEY from env. This step doesn't need either.
+          unset GITHUB_TOKEN GH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+          if ! compgen -G "$PR_HEAD_DIR/.verify-output/*/verify-result.json" >/dev/null; then
+            echo "no verify-result.json — skipping unit-test step"
+            exit 0
+          fi
+          RESULT=$(ls -t "$PR_HEAD_DIR"/.verify-output/*/verify-result.json | head -1)
+
+          # Extract added/modified test files from the captured PR diff.
+          # Pattern matches `*.test.*` and `*.spec.*` under code/ — wide
+          # enough to catch component / utility tests; the workflow has
+          # already declined to run if the PR comment label gate was off.
+          TEST_FILES=()
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            [ -f "$f" ] || continue
+            TEST_FILES+=("$f")
+          done < <(
+            grep -E '^\+\+\+ b/code/.+\.(test|spec)\.(ts|tsx|js|jsx)$' /tmp/pr.diff 2>/dev/null \
+              | sed 's|^+++ b/||' \
+              | sort -u
+          )
+
+          if [ ${#TEST_FILES[@]} -eq 0 ]; then
+            echo "no PR-added unit tests detected — recording n/a"
+            jq '. + {unitTests: {ran: false, files: [], passed: null, summary: "no PR-added test files in diff"}}' \
+              "$RESULT" > "$RESULT.tmp" && mv "$RESULT.tmp" "$RESULT"
+            exit 0
+          fi
+
+          echo "running ${#TEST_FILES[@]} unit test file(s): ${TEST_FILES[*]}"
+          REPORT="$RUNNER_TEMP/unit-tests-report.json"
+
+          # Vitest emits a JSON reporter file when --reporter=json is set.
+          # `set -e` is off for this block so vitest exit codes don't kill
+          # the step; we surface the verdict via JSON inspection.
+          set +e
+          yarn vitest run --reporter=json --outputFile "$REPORT" "${TEST_FILES[@]}" > /tmp/vitest.log 2>&1
+          VITEST_EXIT=$?
+          set -e
+
+          if [ -f "$REPORT" ]; then
+            PASSED=$(jq '.numFailedTests == 0 and .numFailedTestSuites == 0' "$REPORT")
+            SUMMARY=$(jq -r '"\(.numPassedTests) passed, \(.numFailedTests) failed across \(.numTotalTestSuites) suite(s)"' "$REPORT")
+          else
+            PASSED=false
+            SUMMARY="vitest exited $VITEST_EXIT without writing a JSON report (likely setup error); see Action log"
+          fi
+          # Capture the tail of vitest stdout so the comment can show
+          # readable failure output (ANSI-stripped).
+          DETAILS=$(tail -c 4000 /tmp/vitest.log | tr -d '\000' \
+            | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' | jq -Rs .)
+
+          jq \
+            --argjson passed "$PASSED" \
+            --arg summary "$SUMMARY" \
+            --argjson files "$(printf '%s\n' "${TEST_FILES[@]}" | jq -R . | jq -s .)" \
+            --argjson details "$DETAILS" \
+            '. + {unitTests: {ran: true, files: $files, passed: $passed, summary: $summary, details: $details}}' \
+            "$RESULT" > "$RESULT.tmp" && mv "$RESULT.tmp" "$RESULT"
+          echo "unit-tests verdict: $SUMMARY (passed=$PASSED, exit=$VITEST_EXIT)"
 
       - name: Read verdict
         id: verdict
@@ -150,6 +607,42 @@ jobs:
           fi
           if [ -n "$RESULT" ]; then
             VERDICT=$(jq -r '.verdict' "$RESULT")
+            UNIT_RAN=$(jq -r '.unitTests.ran // false' "$RESULT")
+            UNIT_PASSED=$(jq -r '.unitTests.passed // null' "$RESULT")
+            REGRESSION_REASON=$(jq -r '.regressionReason // ""' "$RESULT")
+            # Fill in a regressionReason when Playwright failed but verify-pr
+            # didn't populate one (compile-failure stubs already set their
+            # own reason). Extract the failed test name + first error from
+            # playwright-report.json — reviewers see WHY without needing
+            # the trace.zip.
+            if [ "$VERDICT" = "regression" ] && [ -z "$REGRESSION_REASON" ]; then
+              RUN_DIR=$(dirname "$RESULT")
+              REPORT="$RUN_DIR/playwright-report.json"
+              if [ -f "$REPORT" ]; then
+                DERIVED=$(jq -r '
+                  [.. | objects | select(has("errors") and (.errors | length > 0))] as $failed
+                  | ($failed | map(.title // "?") | unique | .[0:3] | join("; ")) as $titles
+                  | ($failed | .[0].errors[0] | (.message // .stack // tostring)) as $err
+                  | "Playwright assertion failed in: \($titles) — \($err | gsub("\n"; " ") | .[0:400])"
+                ' "$REPORT" 2>/dev/null || true)
+                if [ -n "$DERIVED" ] && [ "$DERIVED" != "null" ] && [ "$DERIVED" != "Playwright assertion failed in:  — null" ]; then
+                  jq --arg reason "$DERIVED" '. + {regressionReason: $reason}' \
+                    "$RESULT" > "$RESULT.tmp" && mv "$RESULT.tmp" "$RESULT"
+                  echo "derived regressionReason: $DERIVED"
+                fi
+              fi
+            fi
+            # Compose final verdict from AND of Playwright + unit tests.
+            # If Playwright already says regression we keep it (Playwright
+            # failure is authoritative). If Playwright passed BUT unit tests
+            # ran and failed, downgrade to regression and annotate the
+            # regressionReason so the comment + red-CI signal reflect it.
+            if [ "$VERDICT" = "verified" ] && [ "$UNIT_RAN" = "true" ] && [ "$UNIT_PASSED" = "false" ]; then
+              VERDICT="regression"
+              jq '. + {verdict: "regression", regressionReason: (.regressionReason // "PR-added unit tests failed (see unitTests.details)")}' \
+                "$RESULT" > "$RESULT.tmp" && mv "$RESULT.tmp" "$RESULT"
+              echo "verdict downgraded: Playwright verified but unit tests failed → regression"
+            fi
             echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
             echo "verdict: $VERDICT" >> "$GITHUB_STEP_SUMMARY"
             jq -r '"target=\(.template) regressionReason=\(.regressionReason // "n/a")"' "$RESULT" >> "$GITHUB_STEP_SUMMARY"
@@ -255,17 +748,117 @@ jobs:
           echo "$URLS" >> "$GITHUB_OUTPUT"
           echo "EOF" >> "$GITHUB_OUTPUT"
 
+      - name: Append telemetry
+        # Append one CSV row per run to telemetry.csv on the
+        # _verify-screenshots side branch. After 10–20 PRs we can answer:
+        # verified-first-try % vs after-retry vs regression, vision
+        # false-negative rate, sandbox-path vs internal-ui breakdown,
+        # duration distribution. Drives v8 prioritisation.
+        if: always() && steps.verdict.outputs.verdict != '' && steps.verdict.outputs.verdict != 'missing'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! compgen -G "$PR_HEAD_DIR/.verify-output/*/verify-result.json" >/dev/null; then
+            echo "no verify-result.json — skipping telemetry"
+            exit 0
+          fi
+          # shellcheck disable=SC2012
+          RESULT=$(ls -t "$PR_HEAD_DIR"/.verify-output/*/verify-result.json | head -1)
+          ROW=$(jq -r --arg run_id "$RUN_ID" --arg pr "$PR_NUMBER" '[
+            $run_id,
+            $pr,
+            .verdict,
+            (.template // "n/a"),
+            (.evidenceVerdict // "n/a"),
+            ((.evidenceRetry // false) | tostring),
+            ((.unitTests.ran // false) | tostring),
+            ((.unitTests.passed // "n/a") | tostring),
+            ((.durations.totalMs // 0) | tostring),
+            (.createdAt // (now | todate))
+          ] | @csv' "$RESULT")
+          echo "telemetry row: $ROW"
+
+          AUTH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
+          CLONE="$RUNNER_TEMP/telemetry-branch"
+          rm -rf "$CLONE"
+          # Push screenshots step created the orphan branch if it was
+          # missing; if Push screenshots was skipped (e.g. no screenshots),
+          # fall back to orphan-create here so telemetry still lands.
+          if ! git -c protocol.version=2 clone --depth 1 --branch _verify-screenshots \
+              "$AUTH_URL" "$CLONE" 2>/dev/null; then
+            echo "side branch missing — bootstrapping for telemetry"
+            git -c protocol.version=2 clone --depth 1 "$AUTH_URL" "$CLONE"
+            (
+              cd "$CLONE"
+              git -c user.email=actions@github.com -c user.name="github-actions[bot]" \
+                checkout --orphan _verify-screenshots
+              git rm -rf . >/dev/null
+              echo "Verify harness screenshot store. Auto-managed; do not edit." > README.md
+              git add README.md
+              git -c user.email=actions@github.com -c user.name="github-actions[bot]" \
+                commit -m "chore: init _verify-screenshots branch"
+              git push origin _verify-screenshots
+            )
+          fi
+          cd "$CLONE"
+          if [ ! -f telemetry.csv ]; then
+            echo "run_id,pr_number,verdict,target,evidence_verdict,evidence_retry,unit_tests_ran,unit_tests_passed,duration_ms,timestamp" > telemetry.csv
+          fi
+          echo "$ROW" >> telemetry.csv
+          git -c user.email=actions@github.com -c user.name="github-actions[bot]" \
+            add telemetry.csv
+          if git diff --cached --quiet; then
+            echo "telemetry row already present — skipping push"
+            exit 0
+          fi
+          git -c user.email=actions@github.com -c user.name="github-actions[bot]" \
+            commit -m "telemetry: PR #${PR_NUMBER} run ${RUN_ID}"
+          git push origin _verify-screenshots
+
+      - name: Stage artifacts (rename dotdirs)
+        # actions/upload-artifact v7 ships dotfiles into the zip, but
+        # tools like macOS Finder + most unzippers hide them by default,
+        # which makes the artifact look empty even though it is ~MBs.
+        # Stage the contents under non-dot names so reviewers can browse
+        # the zip without toggling hidden-file display.
+        if: always()
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          STAGE="$RUNNER_TEMP/verify-artifacts"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/runner-pr-head" "$STAGE/base"
+          if [ -d "$PR_HEAD_DIR/.verify-output" ]; then
+            cp -a "$PR_HEAD_DIR/.verify-output/." "$STAGE/runner-pr-head/verify-output/"
+          fi
+          if [ -d "$PR_HEAD_DIR/.verify-recipes" ]; then
+            mkdir -p "$STAGE/runner-pr-head/verify-recipes"
+            # Only include the materialised PR spec (trusted helpers
+            # _util.ts + example-smoke.spec.ts live in the base copy).
+            if [ -f "$PR_HEAD_DIR/.verify-recipes/pr-${PR_NUMBER}.spec.ts" ]; then
+              cp "$PR_HEAD_DIR/.verify-recipes/pr-${PR_NUMBER}.spec.ts" \
+                "$STAGE/runner-pr-head/verify-recipes/pr-${PR_NUMBER}.spec.ts"
+            fi
+          fi
+          if [ -d "$GITHUB_WORKSPACE/.verify-output" ]; then
+            cp -a "$GITHUB_WORKSPACE/.verify-output/." "$STAGE/base/verify-output/"
+          fi
+          echo "VERIFY_ARTIFACTS_DIR=$STAGE" >> "$GITHUB_ENV"
+          # shellcheck disable=SC2012
+          ls -la "$STAGE" || true
+
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: verify-output-pr-${{ github.event.pull_request.number }}-${{ github.run_id }}
-          path: |
-            ${{ runner.temp }}/pr-head/.verify-output/
-            ${{ runner.temp }}/pr-head/.verify-recipes/pr-${{ github.event.pull_request.number }}.spec.ts
-            .verify-output/
+          path: ${{ env.VERIFY_ARTIFACTS_DIR }}/
           if-no-files-found: warn
-          include-hidden-files: true
           retention-days: 14
       - name: Post PR comment
         if: always()
@@ -311,7 +904,29 @@ jobs:
                 body = `## Verify Harness\n\nNo verdict produced — the workflow failed before the harness ran (likely recipe-author dispatch, deny-regex, or lint). See [run log](${url}) for details.`;
               } else {
                 const verdict = JSON.parse(fs.readFileSync(resultPath, 'utf-8'));
-                body = `## Verify Harness\n\nVerdict: \`${verdict.verdict}\` (target \`${verdict.template}\`)${verdict.regressionReason ? `\n\nReason: \`${verdict.regressionReason}\`` : ''}\n\nReplay: \`npx playwright show-trace\` on the trace.zip in [artifacts](${url}/artifacts).${renderScreenshots()}`;
+                const retrySuffix = verdict.evidenceRetry ? ' (after 1 retry)' : '';
+                const evidenceLine = verdict.evidenceVerdict
+                  ? `\n\nEvidence${retrySuffix} (vision-check, \`${verdict.evidenceModel ?? 'claude-haiku-4-5'}\`): \`${verdict.evidenceVerdict}\`${
+                      verdict.evidenceReasoning
+                        ? `\n\n<details><summary>Vision reasoning</summary>\n\n${verdict.evidenceReasoning}\n\n</details>`
+                        : ''
+                    }`
+                  : '';
+                const detailsBlock = verdict.regressionDetails
+                  ? `\n\n<details><summary>Compile output (last 4KB)</summary>\n\n\`\`\`\n${String(verdict.regressionDetails).slice(0, 4000)}\n\`\`\`\n\n</details>`
+                  : '';
+                let unitTestsLine = '';
+                if (verdict.unitTests && verdict.unitTests.ran) {
+                  const status = verdict.unitTests.passed ? '✅ passed' : '❌ failed';
+                  const filesList = (verdict.unitTests.files ?? [])
+                    .map((f) => `\`${f}\``)
+                    .join(', ');
+                  unitTestsLine = `\n\nPR-added unit tests: ${status} — ${verdict.unitTests.summary || ''}${filesList ? `\n\nFiles: ${filesList}` : ''}`;
+                  if (!verdict.unitTests.passed && verdict.unitTests.details) {
+                    unitTestsLine += `\n\n<details><summary>vitest output (last 4KB)</summary>\n\n\`\`\`\n${String(verdict.unitTests.details).slice(0, 4000)}\n\`\`\`\n\n</details>`;
+                  }
+                }
+                body = `## Verify Harness\n\nVerdict: \`${verdict.verdict}\` (target \`${verdict.template}\`)${verdict.regressionReason ? `\n\nReason: \`${verdict.regressionReason}\`` : ''}${detailsBlock}${evidenceLine}${unitTestsLine}\n\nReplay: \`npx playwright show-trace\` on the trace.zip listed under "Artifacts" on the [run summary page](${url}).${renderScreenshots()}`;
               }
             } catch (err) {
               body = `## Verify Harness\n\nError reading verdict: \`${err.message}\`. See [run log](${url}).`;
@@ -322,3 +937,12 @@ jobs:
               repo: context.repo.repo,
               body,
             });
+
+      - name: Fail job if final verdict is regression
+        # Preserve red-CI signal. Earlier Verify-PR step swallows non-zero
+        # exit so retry can run; this terminal gate restores the fail
+        # signal based on the post-retry verdict.
+        if: always() && steps.verdict.outputs.verdict == 'regression'
+        run: |
+          echo "Final verdict: regression — failing job."
+          exit 1

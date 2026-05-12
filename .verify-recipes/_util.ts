@@ -3,7 +3,10 @@
 // Recipes here are evaluated by Playwright's Node test workers, so anything
 // that requires non-erasable TS is off-limits.
 
+import { test as baseTest, expect as baseExpect } from '@playwright/test';
 import type { Expect, FrameLocator, Locator, Page } from '@playwright/test';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 
 export class RecipePage {
   readonly page: Page;
@@ -46,3 +49,46 @@ export class RecipePage {
     await this.waitForStoryLoaded();
   }
 }
+
+/**
+ * `test` is extended with an auto-running fixture that, on failed/timed-out
+ * tests, captures the preview iframe's accessibility snapshot to
+ * `iframe-snapshot.md` inside the run directory (sibling of error-context.md).
+ *
+ * Playwright's built-in failure capture only snapshots the top-level manager
+ * DOM — iframe content is opaque. The PR verify harness's retry-on-regression
+ * step reads this file (when present) and feeds it into the next attempt's
+ * recipe-author prompt, so the agent sees the actual story / preview DOM that
+ * its locators tried to reach.
+ */
+export const test = baseTest.extend<{ recipeFailureCapture: void }>({
+  recipeFailureCapture: [
+    async ({ page }, use, testInfo) => {
+      await use();
+      if (testInfo.status === 'passed' || testInfo.status === 'skipped') return;
+      try {
+        const previewFrame = page
+          .frames()
+          .find((f) => /preview|iframe\.html/.test(f.url())) ?? page.frames()[1];
+        if (!previewFrame) return;
+        const snapshot = await previewFrame.locator('body').ariaSnapshot({ timeout: 4000 });
+        const dir = testInfo.outputDir;
+        writeFileSync(
+          join(dir, 'iframe-snapshot.md'),
+          `# Preview iframe snapshot at failure\n\n` +
+            `Frame URL: ${previewFrame.url()}\n\n` +
+            `\`\`\`yaml\n${snapshot}\n\`\`\`\n`
+        );
+        await testInfo.attach('iframe-snapshot', {
+          body: snapshot,
+          contentType: 'text/plain',
+        });
+      } catch {
+        /* best-effort — no error must break the test reporter */
+      }
+    },
+    { auto: true },
+  ],
+});
+
+export const expect = baseExpect;

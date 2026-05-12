@@ -20,6 +20,10 @@ import type {
   PromptReferenceSpec,
 } from './verify/agent-prompt.ts';
 import { matchedTriageGlobs, triageReferenceSpecs } from './verify/triage.ts';
+import {
+  deriveRoutesForFiles,
+  type StoryFileRoutes,
+} from './verify/derive-story-routes.ts';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const RECIPES_DIR = path.resolve(repoRoot, '.verify-recipes');
@@ -43,6 +47,11 @@ Options:
                     CI (single-round) passes \$PR_HEAD_DIR/.verify-recipes/pr-<#>.spec.ts
                     so the recipe is materialised directly into the untrusted
                     PR-head workspace without ever being committed.
+  --retry-context <text>
+                    Append a "Retry guidance" section to the prompt with the
+                    given text. Used by the workflow's evidence-missing retry
+                    loop to feed the vision-checker's reasoning back to the
+                    recipe-author dispatch.
   --help            Show this help
 
 Output:
@@ -232,6 +241,198 @@ function readReferenceSpec(absPath: string): PromptReferenceSpec {
   return { path: path.relative(repoRoot, absPath), source };
 }
 
+const STORY_EXT = /\.(stories|story)\.(ts|tsx|js|jsx|cjs|mjs)$|\.mdx$/;
+const MAIN_CONFIG_PATH = path.resolve(repoRoot, 'code/.storybook/main.ts');
+const STORY_ROUTE_FILE_CAP = 8;
+
+/**
+ * Resolve the list of *.stories.* files relevant to the diff, deterministically:
+ *   - Any story file directly touched by the diff.
+ *   - For each non-stories source file under `code/**`, scan its directory
+ *     for sibling *.stories.* files (cap at depth=0 to keep scope tight).
+ * Result is deduped + sorted; capped at STORY_ROUTE_FILE_CAP to bound prompt growth.
+ */
+function collectRelevantStoryFiles(diffPaths: readonly string[]): string[] {
+  const collected = new Set<string>();
+  for (const rel of diffPaths) {
+    if (!rel.startsWith('code/')) continue;
+    const abs = path.resolve(repoRoot, rel);
+    if (STORY_EXT.test(rel)) {
+      if (fs.existsSync(abs)) collected.add(abs);
+      continue;
+    }
+    // Non-stories source: look for sibling story files with the SAME basename
+    // first (e.g. `Object.tsx` -> `Object.stories.tsx`). If none, fall back to
+    // any sibling stories in the directory — capped to one to keep prompt
+    // size sane. Avoids dumping every sibling story file when a single
+    // utility file in a busy directory changes.
+    const dir = path.dirname(abs);
+    if (!fs.existsSync(dir)) continue;
+    const baseName = path.basename(rel).replace(/\.(ts|tsx|js|jsx|cjs|mjs)$/, '');
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    const sameNameStories = entries.filter(
+      (name) => STORY_EXT.test(name) && name.startsWith(`${baseName}.stories.`)
+    );
+    if (sameNameStories.length > 0) {
+      for (const name of sameNameStories) collected.add(path.join(dir, name));
+      continue;
+    }
+    // Otherwise, look for sibling stories that import the changed module by
+    // basename — that is a strong signal the story mounts the changed code.
+    // Cap at 2 matches per source file. If none import it, emit no fallback
+    // (better silent than misleading: random alphabetical siblings have
+    // sent past runs to unrelated stories).
+    const importPattern = new RegExp(
+      `from\\s+['"][^'"]*\\b${baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\.tsx?)?['"]`
+    );
+    const importers: string[] = [];
+    for (const name of entries) {
+      if (!STORY_EXT.test(name)) continue;
+      const storyPath = path.join(dir, name);
+      try {
+        const content = fs.readFileSync(storyPath, 'utf-8');
+        if (importPattern.test(content)) importers.push(storyPath);
+      } catch {
+        /* unreadable — skip */
+      }
+      if (importers.length >= 2) break;
+    }
+    for (const p of importers) collected.add(p);
+  }
+  return [...collected].sort().slice(0, STORY_ROUTE_FILE_CAP);
+}
+
+const STORY_FILE_LINE_CAP = 160;
+const TOUCHED_SOURCE_FILE_LINE_CAP = 250;
+const TOUCHED_SOURCE_FILE_CAP = 4;
+const SOURCE_EXT = /\.(ts|tsx|js|jsx|cjs|mjs)$/;
+const SKIP_SOURCE = /\.(test|spec)\.|__tests__|__mocks__/;
+
+function collectTouchedSourceFiles(diffPaths: readonly string[]): string[] {
+  const matches: string[] = [];
+  for (const rel of diffPaths) {
+    if (!rel.startsWith('code/')) continue;
+    if (STORY_EXT.test(rel)) continue;
+    if (!SOURCE_EXT.test(rel)) continue;
+    if (SKIP_SOURCE.test(rel)) continue;
+    const abs = path.resolve(repoRoot, rel);
+    if (!fs.existsSync(abs)) continue;
+    matches.push(abs);
+    if (matches.length >= TOUCHED_SOURCE_FILE_CAP) break;
+  }
+  return matches;
+}
+
+function renderTouchedSourceFilesSection(filePaths: string[]): string {
+  if (filePaths.length === 0) return '';
+  const blocks = filePaths.map((abs) => {
+    let source: string;
+    try {
+      source = fs.readFileSync(abs, 'utf-8');
+    } catch {
+      return '';
+    }
+    const lines = source.split('\n');
+    const capped = lines.length > TOUCHED_SOURCE_FILE_LINE_CAP;
+    const slice = capped
+      ? lines.slice(0, TOUCHED_SOURCE_FILE_LINE_CAP).join('\n')
+      : source;
+    const trailer = capped
+      ? `\n// ... (${lines.length - TOUCHED_SOURCE_FILE_LINE_CAP} more lines elided)`
+      : '';
+    const rel = path.relative(repoRoot, abs);
+    const fenceLang = rel.endsWith('.tsx') || rel.endsWith('.jsx') ? 'tsx' : 'ts';
+    return `### ${rel}\n\n\`\`\`${fenceLang}\n${slice}${trailer}\n\`\`\``;
+  });
+  const populated = blocks.filter(Boolean);
+  if (populated.length === 0) return '';
+  return [
+    '## Touched source files (full context for the diff)',
+    '',
+    'The PR diff hunks alone often miss the surrounding code that determines',
+    'how to drive the component at runtime (component definitions, conditional',
+    'rendering predicates, aria-labels on toggles, etc). Each file below is the',
+    'CURRENT full source on disk (post-diff state), capped at 250 lines per file.',
+    'Read these to understand selectors / mount conditions before authoring.',
+    '',
+    ...populated,
+  ].join('\n');
+}
+
+function renderStoryRoutesSection(routes: StoryFileRoutes[]): string {
+  if (routes.length === 0) return '';
+  const blocks = routes.map((r) => {
+    const relPath = path.relative(repoRoot, r.filePath);
+    const lines: string[] = [];
+    lines.push(`- **${relPath}**`);
+    lines.push(`  - title: \`${r.title}\``);
+    lines.push(`  - autodocs: ${r.autodocs}`);
+    if (r.routes.length === 0) {
+      if (r.autodocs) {
+        lines.push(`  - docs route: \`/?path=/docs/${r.kindId}--docs\``);
+      } else {
+        lines.push('  - routes: (no exported stories detected)');
+      }
+    } else {
+      const previewRoutes = r.routes.slice(0, 8);
+      for (const route of previewRoutes) {
+        const docsSuffix = route.docsUrl ? ` | docs: \`${route.docsUrl}\`` : '';
+        lines.push(`  - \`${route.exportName}\` → \`${route.storyUrl}\`${docsSuffix}`);
+      }
+      if (r.routes.length > previewRoutes.length) {
+        lines.push(`  - (+${r.routes.length - previewRoutes.length} more exports)`);
+      }
+    }
+    return lines.join('\n');
+  });
+  return [
+    '## Story routes (computed deterministically by the harness)',
+    '',
+    'These routes are derived from `code/.storybook/main.ts` + the story files themselves using',
+    'Storybook’s own auto-title + `toId` algorithms. Use them verbatim — do NOT re-derive kebab-case',
+    'kind-ids by hand; that has 404’d in past runs.',
+    '',
+    ...blocks,
+  ].join('\n');
+}
+
+function renderStoryFileSourcesSection(routes: StoryFileRoutes[]): string {
+  if (routes.length === 0) return '';
+  const sections = routes.map((r) => {
+    const relPath = path.relative(repoRoot, r.filePath);
+    let source: string;
+    try {
+      source = fs.readFileSync(r.filePath, 'utf-8');
+    } catch {
+      return '';
+    }
+    const linesArr = source.split('\n');
+    const capped = linesArr.length > STORY_FILE_LINE_CAP;
+    const slice = capped ? linesArr.slice(0, STORY_FILE_LINE_CAP).join('\n') : source;
+    const trailer = capped
+      ? `\n// ... (${linesArr.length - STORY_FILE_LINE_CAP} more lines elided)`
+      : '';
+    return `### ${relPath}\n\n\`\`\`tsx\n${slice}${trailer}\n\`\`\``;
+  });
+  const populated = sections.filter(Boolean);
+  if (populated.length === 0) return '';
+  return [
+    '## Story file sources (siblings / direct targets of the diff)',
+    '',
+    'Read these to understand how the story mounts the component the diff touches —',
+    '`meta.args`, `meta.parameters`, and story-level `args` reveal what the rendered',
+    'DOM looks like (e.g. `args: { name: "object" }` means the underlying input id /',
+    'label text is derived from `"object"`, not from `"value"` or the story export name).',
+    '',
+    ...populated,
+  ].join('\n');
+}
+
 async function main(argv: string[]): Promise<number> {
   const { values: flags } = parseArgs({
     args: argv,
@@ -239,6 +440,7 @@ async function main(argv: string[]): Promise<number> {
       pr: { type: 'string' },
       force: { type: 'boolean', default: false },
       output: { type: 'string' },
+      'retry-context': { type: 'string' },
       help: { type: 'boolean', default: false },
     },
     strict: true,
@@ -323,7 +525,53 @@ async function main(argv: string[]): Promise<number> {
     authoringGuide,
   };
 
-  const prompt = buildRecipeAuthorPrompt(promptInput);
+  let prompt = buildRecipeAuthorPrompt(promptInput);
+
+  // Pre-compute canonical story routes for files touched by the diff (and
+  // siblings of non-stories source files). Storybook auto-title + toId are
+  // path-dependent enough that agents have 404'd guessing kind-ids by hand.
+  // The harness now derives them deterministically and surfaces the result
+  // so the agent uses the real route.
+  const { storyRoutesSection, storyFileSourcesSection } = (() => {
+    try {
+      const candidates = collectRelevantStoryFiles(prMeta.files.map((f) => f.path));
+      if (candidates.length === 0) return { storyRoutesSection: '', storyFileSourcesSection: '' };
+      const derived = deriveRoutesForFiles(MAIN_CONFIG_PATH, candidates);
+      return {
+        storyRoutesSection: renderStoryRoutesSection(derived),
+        storyFileSourcesSection: renderStoryFileSourcesSection(derived),
+      };
+    } catch (err) {
+      console.error(
+        `[verify-pr-generate] derive-story-routes failed (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+      return { storyRoutesSection: '', storyFileSourcesSection: '' };
+    }
+  })();
+  if (storyRoutesSection) {
+    prompt = `${prompt}\n\n---\n\n${storyRoutesSection}`;
+  }
+  if (storyFileSourcesSection) {
+    prompt = `${prompt}\n\n---\n\n${storyFileSourcesSection}`;
+  }
+  const touchedSourceFiles = collectTouchedSourceFiles(prMeta.files.map((f) => f.path));
+  const touchedSourceFilesSection = renderTouchedSourceFilesSection(touchedSourceFiles);
+  if (touchedSourceFilesSection) {
+    prompt = `${prompt}\n\n---\n\n${touchedSourceFilesSection}`;
+  }
+
+  // Retry-loop context: workflow re-invokes verify-pr-generate with
+  // --retry-context "<reasoning>" when a prior attempt either (a) had the
+  // evidence-checker rule the screenshots 'missing'/'undetermined' OR
+  // (b) failed Playwright assertions outright (regression verdict). Both
+  // paths feed back useful signal — vision reasoning for case (a), error
+  // context + page snapshot for case (b). Append as a final section so the
+  // next dispatch knows what the previous spec got wrong.
+  if (flags['retry-context']) {
+    prompt = `${prompt}\n\n---\n\n## Retry guidance — previous attempt did not verify the diff\n\nThe previous attempt either failed its assertions or did not surface the diff's visible change in its screenshots. Feedback from that run:\n\n${flags['retry-context']}\n\nWhen authoring this attempt, set up the UI state required to make the diff's visible change appear (see authoring-guide §8.1). If a selector/route timed out, prefer the actual DOM names from the feedback (page snapshots show ground truth). If the trigger state genuinely cannot be reached from a Playwright recipe (filesystem mutation or process action recipes cannot perform), say so explicitly in a single-line comment in the spec body and keep the recipe limited to module-resolution + pageerror verification. Do NOT repeat the previous attempt's approach.`;
+  }
 
   const bundle: PromptBundle = {
     version: 1,
