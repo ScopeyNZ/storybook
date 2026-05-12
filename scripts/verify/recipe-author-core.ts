@@ -137,8 +137,11 @@ function buildProvenanceHeader(bundle: PromptBundle, generatedAt: string): strin
     ` * referenceSpecs: ${refs}`,
     ` * triageGlobs: ${globs}`,
     ` *`,
-    ` * This file is human-reviewed before execution. Edit freely; the`,
-    ` * provenance block above is informational only.`,
+    ` * Local-dev: this file is human-reviewed before execution. Edit freely.`,
+    ` * CI single-round: this file is materialised into the runner workspace`,
+    ` * and executed without intermediate human review. Deny-regex + scoped`,
+    ` * lint are the load-bearing controls (see scripts/verify/SECURITY.md).`,
+    ` * Provenance block above is informational only.`,
     ' */',
     '',
   ].join('\n');

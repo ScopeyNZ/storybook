@@ -4,6 +4,11 @@ on:
     types: [labeled, synchronize]
     paths-ignore: ['docs/**', '**/*.md', '.github/**']
 
+# v6 single-round model: recipe is authored AND executed in the same workflow
+# run. The authored spec is materialised straight into the untrusted PR-head
+# workspace ($RUNNER_TEMP/pr-head/.verify-recipes/pr-<#>.spec.ts) — never
+# committed. See scripts/verify/SECURITY.md for the load-bearing controls.
+
 jobs:
   verify:
     if: github.event.pull_request.draft == false && contains(github.event.pull_request.labels.*.name, 'ci:verify')
@@ -25,28 +30,26 @@ jobs:
       - name: Checkout base
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: ${{ github.event.pull_request.base.sha }}
+          # `pull_request.base.sha` is captured at PR creation / sync and lags
+          # behind the actual base-branch tip when the base advances independently
+          # of the PR head. The harness depends on always-latest trusted scripts
+          # (verify-pr-generate flags, deny-regex, lint config) so we pin to the
+          # branch ref instead — pull_request_target keeps execution on trusted
+          # workflow + script content either way.
+          ref: ${{ github.event.pull_request.base.ref }}
       - name: Setup Node.js and Install Dependencies
         uses: ./.github/actions/setup-node-and-install
         with:
           install-code-deps: true
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-      - name: Fetch PR diff
-        run: gh pr diff ${{ github.event.pull_request.number }} > /tmp/pr.diff
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Generate bundle
-        run: yarn verify-pr-generate --pr ${{ github.event.pull_request.number }} --force
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - name: Author recipe
-        run: |
-          # shellcheck disable=SC2012
-          BUNDLE=$(ls -t .verify-output/*/prompt-bundle.json | head -1)
-          yarn verify-pr-author --bundle "$BUNDLE"
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Compute paths
+        # Export PR_HEAD_DIR via $GITHUB_ENV so every subsequent step can
+        # reference $PR_HEAD_DIR (shell) or ${{ env.PR_HEAD_DIR }} (YAML).
+        # ${{ runner.temp }} is only valid in step contexts, not at job-env
+        # level — this is the canonical workaround.
+        run: echo "PR_HEAD_DIR=${{ runner.temp }}/pr-head" >> "$GITHUB_ENV"
 
       - name: Checkout PR head (untrusted execution context)
         # Manual git clone instead of actions/checkout because the repo carries
@@ -65,7 +68,6 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REPO: ${{ github.repository }}
-          PR_HEAD_DIR: ${{ runner.temp }}/pr-head
         run: |
           set -euo pipefail
           git -c protocol.version=2 clone \
@@ -78,15 +80,36 @@ jobs:
           git remote set-url origin "https://github.com/${REPO}.git"
           git config --local --unset-all credential.helper 2>/dev/null || true
 
-      - name: Spec precheck
-        id: spec_precheck
-        uses: ./.github/actions/verify-spec-precheck
-        with:
-          pr-number: ${{ github.event.pull_request.number }}
-          head-checkout-path: ${{ runner.temp }}/pr-head
+      - name: Fetch PR diff
+        run: gh pr diff ${{ github.event.pull_request.number }} > /tmp/pr.diff
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate bundle
+        # Trusted scripts (base checkout) read trusted authoring-guide +
+        # canonical smoke + triage rules from the base. The bundle's
+        # outputSpecPath is set to the ephemeral PR-head path so the Author
+        # step writes the recipe straight into the untrusted workspace.
+        run: |
+          yarn verify-pr-generate \
+            --pr ${{ github.event.pull_request.number }} \
+            --force \
+            --output "$PR_HEAD_DIR/.verify-recipes/pr-${{ github.event.pull_request.number }}.spec.ts"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Author recipe
+        # ANTHROPIC_API_KEY is scoped to THIS step only. The Verify step that
+        # executes the authored spec has no API key. Static deny-regex +
+        # scoped lint inside recipe-author-core gate what lands on disk.
+        run: |
+          # shellcheck disable=SC2012
+          BUNDLE=$(ls -t .verify-output/*/prompt-bundle.json | head -1)
+          yarn verify-pr-author --bundle "$BUNDLE"
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
       - name: Verify PR
-        if: steps.spec_precheck.outputs.spec-present == 'true'
         working-directory: ${{ runner.temp }}/pr-head
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -118,9 +141,7 @@ jobs:
 
       - name: Read verdict
         id: verdict
-        if: always() && steps.spec_precheck.outputs.spec-present == 'true'
-        env:
-          PR_HEAD_DIR: ${{ runner.temp }}/pr-head
+        if: always()
         run: |
           set -euo pipefail
           RESULT=""
@@ -157,7 +178,6 @@ jobs:
         if: always() && steps.verdict.outputs.verdict != '' && steps.verdict.outputs.verdict != 'missing'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_HEAD_DIR: ${{ runner.temp }}/pr-head
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
@@ -240,14 +260,16 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: verify-output-pr-${{ github.event.pull_request.number }}-${{ github.run_id }}
-          path: ${{ runner.temp }}/pr-head/.verify-output/
+          path: |
+            ${{ runner.temp }}/pr-head/.verify-output/
+            ${{ runner.temp }}/pr-head/.verify-recipes/pr-${{ github.event.pull_request.number }}.spec.ts
+            .verify-output/
           if-no-files-found: warn
           include-hidden-files: true
           retention-days: 14
       - name: Post PR comment
         if: always()
         env:
-          PR_HEAD_DIR: ${{ runner.temp }}/pr-head
           SCREENSHOT_URLS: ${{ steps.screenshots.outputs.urls }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
@@ -274,11 +296,6 @@ jobs:
 
             let body;
             try {
-              if (process.env.SPEC_PRESENT === 'false') {
-                body = `## Verify Harness\n\nVerdict: \`not-applicable\` for PR \`${context.issue.number}\`. Either:\n- no spec authored this run — re-fire \`ci:verify\` after running the verify-recipe-author skill, or\n- a spec was authored locally but not yet committed at head — commit \`pr-${context.issue.number}.spec.ts\` and push.\n\nSee [run log](${url}).`;
-                await github.rest.issues.createComment({ issue_number: context.issue.number, owner: context.repo.owner, repo: context.repo.repo, body });
-                return;
-              }
               const root = path.join(process.env.PR_HEAD_DIR || 'pr-head', '.verify-output');
               const dirs = fs.existsSync(root)
                 ? fs.readdirSync(root, { withFileTypes: true })
@@ -291,7 +308,7 @@ jobs:
                 .map((d) => path.join(root, d, 'verify-result.json'))
                 .find((p) => fs.existsSync(p));
               if (!resultPath) {
-                body = `## Verify Harness\n\nNo verdict produced (workflow failed before harness ran). See [run log](${url}).`;
+                body = `## Verify Harness\n\nNo verdict produced — the workflow failed before the harness ran (likely recipe-author dispatch, deny-regex, or lint). See [run log](${url}) for details.`;
               } else {
                 const verdict = JSON.parse(fs.readFileSync(resultPath, 'utf-8'));
                 body = `## Verify Harness\n\nVerdict: \`${verdict.verdict}\` (target \`${verdict.template}\`)${verdict.regressionReason ? `\n\nReason: \`${verdict.regressionReason}\`` : ''}\n\nReplay: \`npx playwright show-trace\` on the trace.zip in [artifacts](${url}/artifacts).${renderScreenshots()}`;

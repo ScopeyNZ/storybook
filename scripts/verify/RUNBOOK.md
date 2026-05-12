@@ -30,9 +30,10 @@ yarn verify-pr-generate --pr <#> --force
 yarn verify-pr-author --bundle .verify-output/<runId>/prompt-bundle.json
 ```
 
-The CLI emits `.verify-recipes/pr-<#>.spec.ts`. Commit it before the
-next run. (Local-loop iteration does not require a commit, but CI
-gates on the spec being present at PR head — see below.)
+The CLI emits `.verify-recipes/pr-<#>.spec.ts`. In local-dev you can
+re-run the harness immediately; commit only if you want to capture the
+spec in the PR history. CI does **not** require a committed spec — it
+authors and executes the recipe in the same run (single-round flow).
 
 ### Signal: `Port 6006 already in use by PID(s) <n>`
 
@@ -142,27 +143,26 @@ If the compile fails for the same reason locally, the PR has a
 genuine compile regression. If it passes locally but fails in CI,
 inspect cache state — `yarn nx reset` can rule out stale cache.
 
-### Signal: `not-applicable` verdict, no harness ran
+### Signal: PR comment renders "No verdict produced …"
 
-The `verify-spec-precheck` composite action did not find
-`.verify-recipes/pr-<#>.spec.ts` at the PR head. Either:
+In single-round mode the workflow failed before `verify-pr` could write
+a verdict. Most common causes:
 
-- The recipe was authored locally but not committed/pushed yet.
-  Commit the spec on the PR branch and push.
-- The `Author recipe` step in the same workflow run wrote a candidate
-  to the **base** checkout, but that candidate is not the spec the
-  runner executes — only the committed spec at PR head is. The
-  workflow's PR comment surfaces the candidate's location in
-  artefacts so the maintainer can review + commit.
+- **`Author recipe` step failed.** Deny-regex match, lint failure on
+  both attempts, or extract-failure (LLM did not emit
+  `<<<SPEC_START>>>…<<<SPEC_END>>>` fence). The author script's
+  `result.json` under `.verify-output/<runId>/` (base checkout — uploaded
+  as part of the artefact bundle) has the exact failure status.
+- **`Verify PR` step failed before `writeResult`.** Compile error,
+  Playwright install failure, or boot failure. The step's stdout has
+  the trace; `pr-head/.verify-output/` will be empty.
 
 ### Signal: `Apply verified-by-harness label` is skipped
 
-The `verdict` step runs only when `spec-present` is `true`. If
-spec-present was `false`, the workflow skips both `verdict` and the
-label step. If spec-present was `true` but `verdict.outputs.verdict`
-is not `verified` (i.e. `regression` or `missing`), the label step
-correctly does not apply the label. Inspect
-`pr-head/.verify-output/*/verify-result.json` via the artefact bundle.
+The label step gates on `verdict == 'verified'`. Any other verdict
+(`regression`, `missing`, `skipped`) correctly skips the label.
+Inspect `pr-head/.verify-output/*/verify-result.json` via the artefact
+bundle to see the actual verdict + regressionReason.
 
 ### Signal: PR comment renders `Error reading verdict: …`
 

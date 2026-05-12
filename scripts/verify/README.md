@@ -240,39 +240,49 @@ mutated outside `.verify-output/`.
 
 ## Security
 
-See [`SECURITY.md`](./SECURITY.md). The single load-bearing control is
-the committed-spec review at the PR head. `ANTHROPIC_API_KEY` is
-scoped to the `Author recipe` workflow step only; the verify step that
-executes the committed spec never sees the key.
+See [`SECURITY.md`](./SECURITY.md). v6 single-round drops the
+committed-spec human review. Load-bearing controls become:
+`ANTHROPIC_API_KEY` scoped to the `Author recipe` step only, static
+deny-regex (`recipe-deny.ts`), scoped lint, structural pattern checks
+(listener-before-goto, finally-attach), controlled `outputSpecPath` set
+by trusted base scripts, actor-permission gate (`write` access required
+to apply `ci:verify`), and label-gate on non-draft PRs.
 
 ## CI
 
 [`/.github/workflows/verify-pr.yml`](../../.github/workflows/verify-pr.yml).
 Triggered by the `ci:verify` label on a non-draft PR opened by a
-write-permission actor. Workflow shape:
+write-permission actor. Single-round workflow shape:
 
 1. `Check actor permission` (≥ write).
 2. Checkout base SHA + install root deps + setup Bun.
-3. `gh pr diff` → `/tmp/pr.diff`.
-4. `yarn verify-pr-generate --pr <#> --force` (emits the prompt bundle).
-5. `yarn verify-pr-author --bundle …` (writes the agent-authored spec
-   to base for human review).
-6. Manual `git clone` PR head into `pr-head/` (submodule-safe; never
-   writes auth into `pr-head/.git`).
-7. `verify-spec-precheck` composite action — gates the verify step on
-   a committed spec being present at PR head.
-8. **Verify PR** (only when spec-present):
+3. Manual `git clone` PR head into `$RUNNER_TEMP/pr-head/`
+   (submodule-safe; never writes auth into `pr-head/.git`).
+4. `gh pr diff` → `/tmp/pr.diff`.
+5. `yarn verify-pr-generate --pr <#> --force --output
+   $PR_HEAD_DIR/.verify-recipes/pr-<#>.spec.ts` — trusted base scripts
+   read trusted authoring-guide + canonical-smoke and emit the prompt
+   bundle with the ephemeral output path baked in.
+6. `yarn verify-pr-author --bundle …` (ANTHROPIC_API_KEY scoped here)
+   dispatches the LLM, runs deny-regex + lint, and renames the
+   candidate spec onto `$PR_HEAD_DIR/.verify-recipes/pr-<#>.spec.ts`.
+7. **Verify PR** (working-directory = `$PR_HEAD_DIR`):
    ```bash
    yarn install --immutable
-   yarn nx run-many -t compile -p core,cli,create-storybook
+   yarn playwright install --with-deps chromium
+   yarn nx compile core
+   yarn nx run-many -t compile
    yarn verify-pr --recipe-spec ".verify-recipes/pr-${PR_NUMBER}.spec.ts"
    ```
-9. Read verdict from `verify-result.json`. On `verified`, apply
-   `verified-by-harness` label. Always upload artefacts + post PR
-   comment.
+8. Read verdict from `verify-result.json`. On `verified`, apply
+   `verified-by-harness` label. Push screenshots to the
+   `_verify-screenshots` side branch, upload artefacts, post PR
+   comment with verdict + inline screenshots.
 
 The runner is a stock GitHub Actions ephemeral VM — same isolation
-profile as existing Storybook PR CI.
+profile as existing Storybook PR CI. The authored spec lives inside the
+ephemeral runner workspace only; it is uploaded as part of the artefact
+bundle for replay but never committed to any branch.
 
 ## Increment 2 — prompt-bundle generation
 
@@ -299,9 +309,12 @@ Both share `scripts/verify/recipe-author-core.ts`:
 
 The core encapsulates: deny-regex pass, provenance header, lint
 invocation, retry-policy lookup, framed-retry emission on **exit 75**
-(stable contract — see `recipe-retry-policy.ts`), and final write of
-the committed spec. `VERIFY_PR_AUTHOR_STUB_REPLY` env stubs the agent
-reply for parity tests across paths.
+(stable contract — see `recipe-retry-policy.ts`), and final atomic
+rename of the candidate onto `bundle.outputSpecPath` (local-dev →
+`.verify-recipes/pr-<#>.spec.ts`; CI single-round →
+`$PR_HEAD_DIR/.verify-recipes/pr-<#>.spec.ts`).
+`VERIFY_PR_AUTHOR_STUB_REPLY` env stubs the agent reply for parity
+tests across paths.
 
 ## References
 

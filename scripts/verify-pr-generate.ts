@@ -33,17 +33,23 @@ const TOTAL_FILE_CAP = 20;
 const AGENT_MODEL_HINT = 'claude-opus-4-7[1m]';
 
 const HELP = `
-Usage: bun scripts/verify-pr-generate.ts --pr <number> [--force]
+Usage: bun scripts/verify-pr-generate.ts --pr <number> [--force] [--output <path>]
 
 Options:
-  --pr <number>   GitHub PR number to generate a recipe author prompt for (required)
-  --force         Allow overwriting an existing .verify-recipes/pr-<#>.spec.ts
-  --help          Show this help
+  --pr <number>     GitHub PR number to generate a recipe author prompt for (required)
+  --force           Allow overwriting an existing output spec
+  --output <path>   Absolute or repo-relative path the authored spec must land at.
+                    Defaults to .verify-recipes/pr-<#>.spec.ts (local-dev path).
+                    CI (single-round) passes \$PR_HEAD_DIR/.verify-recipes/pr-<#>.spec.ts
+                    so the recipe is materialised directly into the untrusted
+                    PR-head workspace without ever being committed.
+  --help            Show this help
 
 Output:
   Writes a prompt bundle to .verify-output/<runId>/prompt-bundle.json and
   prints the next-step command. Does NOT dispatch the agent or write the
-  final spec — invoke the verify-recipe-author skill on the bundle path.
+  final spec — invoke the verify-recipe-author skill (local) or
+  verify-pr-author --dispatch-mode sdk (CI) on the bundle path.
 `.trim();
 
 interface GhPRMetaRaw {
@@ -232,6 +238,7 @@ async function main(argv: string[]): Promise<number> {
     options: {
       pr: { type: 'string' },
       force: { type: 'boolean', default: false },
+      output: { type: 'string' },
       help: { type: 'boolean', default: false },
     },
     strict: true,
@@ -258,11 +265,17 @@ async function main(argv: string[]): Promise<number> {
   await pruneOldRuns();
   await ensureRunDir(paths);
 
-  // D9 spec-name collision pre-flight.
-  const outputSpecPath = path.resolve(RECIPES_DIR, `pr-${prNumber}.spec.ts`);
+  // D9 spec-name collision pre-flight. --output overrides the default local-dev
+  // path (e.g. CI passes an ephemeral path under the PR-head workspace).
+  const outputSpecPath = flags.output
+    ? path.isAbsolute(flags.output)
+      ? flags.output
+      : path.resolve(repoRoot, flags.output)
+    : path.resolve(RECIPES_DIR, `pr-${prNumber}.spec.ts`);
   if (fs.existsSync(outputSpecPath) && !flags.force) {
     console.error(
-      `[verify] .verify-recipes/pr-${prNumber}.spec.ts already exists. Pass --force to overwrite.`
+      `[verify] ${path.relative(repoRoot, outputSpecPath) || outputSpecPath} already exists. ` +
+        `Pass --force to overwrite.`
     );
     return 1;
   }
