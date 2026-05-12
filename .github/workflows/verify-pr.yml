@@ -619,12 +619,20 @@ jobs:
               RUN_DIR=$(dirname "$RESULT")
               REPORT="$RUN_DIR/playwright-report.json"
               if [ -f "$REPORT" ]; then
+                # `.suites[].specs[].title` is the canonical test name in
+                # Playwright's JSON reporter. Fall back to `.title` on nested
+                # objects when the structure varies.
                 DERIVED=$(jq -r '
                   [.. | objects | select(has("errors") and (.errors | length > 0))] as $failed
-                  | ($failed | map(.title // "?") | unique | .[0:3] | join("; ")) as $titles
+                  | [.. | objects | select(has("title") and has("ok") and .ok == false) | .title] as $titles_alt
+                  | (($failed | map(.title // empty) + $titles_alt) | unique | map(select(. != "" and . != null)) | .[0:3] | join("; ")) as $titles
                   | ($failed | .[0].errors[0] | (.message // .stack // tostring)) as $err
-                  | "Playwright assertion failed in: \($titles) — \($err | gsub("\n"; " ") | .[0:400])"
+                  | "Playwright assertion failed in: \( if $titles == "" then "?" else $titles end ) — \($err | gsub("\n"; " ") | .[0:400])"
                 ' "$REPORT" 2>/dev/null || true)
+                # Strip ANSI escape sequences — Playwright's expect()
+                # message embeds raw colour codes that render as ^[[2m
+                # / ^[[31m noise in the PR comment.
+                DERIVED=$(printf '%s' "$DERIVED" | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g')
                 if [ -n "$DERIVED" ] && [ "$DERIVED" != "null" ] && [ "$DERIVED" != "Playwright assertion failed in:  — null" ]; then
                   jq --arg reason "$DERIVED" '. + {regressionReason: $reason}' \
                     "$RESULT" > "$RESULT.tmp" && mv "$RESULT.tmp" "$RESULT"
