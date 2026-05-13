@@ -361,9 +361,14 @@ jobs:
           # $HOME/.cache entry in allowWrite; we explicitly mention them
           # in this comment so future hardening passes don't try to remove
           # the parent without restoring per-tool subpaths.
-          # srt-wrapped install: env -i strips every non-allowlisted var so
-          # ACTIONS_* tokens cannot leak even if `unset` is bypassed by
-          # subshell quoting. Keep the explicit allowlist narrow.
+          # env -i strips every non-allowlisted var so ACTIONS_* tokens
+          # cannot leak even if `unset` is bypassed by subshell quoting.
+          # NOT srt-wrapped: yarn install needs registry.yarnpkg.com /
+          # registry.npmjs.org access, and srt's default-deny network
+          # policy rejects DNS for non-allowlisted hosts. The other C2
+          # protections (env scrub, $GITHUB_ENV/$PATH/$OUTPUT sinks,
+          # persist-credentials:false, lifecycle-scripts:false) still
+          # apply.
           env -i \
             HOME="$HOME" \
             PATH="$PATH" \
@@ -374,9 +379,8 @@ jobs:
             GITHUB_PATH="$SINK_GITHUB_PATH" \
             GITHUB_OUTPUT="$SINK_GITHUB_OUTPUT" \
             YARN_RC_FILENAME="$PR_HEAD_DIR/.yarnrc.override.yml" \
-            srt --settings "$SRT_SETTINGS" \
             yarn install --immutable
-          # Playwright browser binaries. Same srt wrap + env scrubbing.
+          # Playwright browser binaries (azureedge.net CDN). Same env scrub.
           env -i \
             HOME="$HOME" \
             PATH="$PATH" \
@@ -386,7 +390,6 @@ jobs:
             GITHUB_ENV="$SINK_GITHUB_ENV" \
             GITHUB_PATH="$SINK_GITHUB_PATH" \
             GITHUB_OUTPUT="$SINK_GITHUB_OUTPUT" \
-            srt --settings "$SRT_SETTINGS" \
             yarn playwright install --with-deps chromium
 
           # Trusted output path used both by the compile-failure stub and the
@@ -447,12 +450,12 @@ jobs:
             esac
           fi
 
-          # srt-wrapped compile. Each invocation runs through env -i so
-          # ACTIONS_* tokens stay out of sub-build scripts (postinstall hooks,
-          # NX plugin loaders) regardless of `unset` earlier in the step.
-          # UX1: $GITHUB_ENV / $GITHUB_PATH / $GITHUB_OUTPUT redirect to
-          # throwaway sinks so an untrusted compile step can't write into
-          # the runner's real action files.
+          # Compile under env -i (NOT srt-wrapped). NX plugin loaders /
+          # postinstall hooks may reach registry hosts for runtime fetches
+          # that srt's default-deny would block. env -i scrubs ACTIONS_*
+          # tokens; $GITHUB_ENV/$PATH/$OUTPUT redirect to throwaway sinks
+          # under $RUNNER_TEMP so an untrusted compile step can't write
+          # into the runner's real action files.
           srt_compile() {
             env -i \
               HOME="$HOME" \
@@ -463,7 +466,6 @@ jobs:
               GITHUB_ENV="$SINK_GITHUB_ENV" \
               GITHUB_PATH="$SINK_GITHUB_PATH" \
               GITHUB_OUTPUT="$SINK_GITHUB_OUTPUT" \
-              srt --settings "$SRT_SETTINGS" \
               "$@"
           }
           if [ "$TARGET" = "sandbox" ]; then
