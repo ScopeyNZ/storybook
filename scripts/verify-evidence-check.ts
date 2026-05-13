@@ -232,6 +232,26 @@ async function main(rawArgv: string[]): Promise<number> {
       .map((b) => b.text)
       .join('')
       .trim();
+    // Surface the full vision response on stderr so reviewers can see the
+    // raw reasoning live in the Action log, and persist to the run dir so
+    // it lands in the uploaded artifact zip alongside verify-result.json.
+    const banner = `===== [evidence-check] vision response (model ${MODEL}) =====`;
+    console.error(banner);
+    console.error(reply);
+    console.error('='.repeat(banner.length));
+    try {
+      fs.writeFileSync(
+        path.join(resultDir, 'evidence-check-response.json'),
+        JSON.stringify(
+          { model: MODEL, usage: response.usage, assistantText: reply },
+          null,
+          2
+        ) + '\n',
+        'utf-8'
+      );
+    } catch {
+      // artifact emission is best-effort
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[evidence-check] vision dispatch failed: ${msg}`);

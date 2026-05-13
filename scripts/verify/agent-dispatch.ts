@@ -157,10 +157,6 @@ function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function isDebugEnabled(): boolean {
-  return Boolean(process.env.DEBUG && process.env.DEBUG.includes('verify-pr-author'));
-}
-
 function redactRequestBody(req: Anthropic.MessageCreateParams): unknown {
   // Allowlist redaction — only emit known-safe fields. Never serialize
   // headers, api keys, base URLs, or anything we can't account for.
@@ -186,7 +182,7 @@ function redactRequestBody(req: Anthropic.MessageCreateParams): unknown {
   };
 }
 
-function writeDebugArtifacts(
+function writeDispatchArtifacts(
   runDir: string,
   req: Anthropic.MessageCreateParams,
   result: { assistantText: string; usage: Anthropic.Usage } | null,
@@ -201,6 +197,21 @@ function writeDebugArtifacts(
       JSON.stringify(redacted, null, 2) + '\n',
       'utf-8'
     );
+    if (result) {
+      fs.writeFileSync(
+        path.join(runDir, 'dispatch-response.json'),
+        JSON.stringify(
+          {
+            model: req.model,
+            usage: result.usage,
+            assistantText: result.assistantText,
+          },
+          null,
+          2
+        ) + '\n',
+        'utf-8'
+      );
+    }
     const logLine = {
       ts: new Date().toISOString(),
       attempt,
@@ -211,8 +222,20 @@ function writeDebugArtifacts(
     };
     fs.appendFileSync(path.join(runDir, 'dispatch.log'), JSON.stringify(logLine) + '\n', 'utf-8');
   } catch {
-    // debug logging is best-effort
+    // artifact emission is best-effort
   }
+}
+
+function logAssistantText(label: string, text: string): void {
+  // Surface the full assistant response on stderr so reviewers can watch
+  // the agent's reasoning live in the Action log. The deny-regex + lint
+  // already gate what lands on disk, and CI logs are admin-only for
+  // private repos and run-scoped for public ones; we deliberately do not
+  // truncate.
+  const banner = `===== ${label} (assistant response) =====`;
+  console.error(banner);
+  console.error(text);
+  console.error('='.repeat(banner.length));
 }
 
 export async function dispatchRecipeAuthor(
@@ -223,7 +246,7 @@ export async function dispatchRecipeAuthor(
     const abs = path.isAbsolute(stubPath) ? stubPath : path.resolve(process.cwd(), stubPath);
     const assistantText = fs.readFileSync(abs, 'utf-8');
     const result = { assistantText, usage: STUB_USAGE };
-    if (isDebugEnabled() && input.runDir) {
+    if (input.runDir) {
       // AC-V4-9: redaction is verified via stub-mode dispatch; emit the
       // would-be request body (with cache_control markers preserved) so
       // verification can grep for absence of api-key headers.
@@ -232,7 +255,7 @@ export async function dispatchRecipeAuthor(
         model: input.model,
         retryMessage: input.retryMessage,
       });
-      writeDebugArtifacts(input.runDir, request, result, null, 1);
+      writeDispatchArtifacts(input.runDir, request, result, null, 1);
     }
     return result;
   }
@@ -266,16 +289,20 @@ export async function dispatchRecipeAuthor(
             .join('')
         : '';
       const result = { assistantText, usage: response.usage };
-      if (isDebugEnabled() && input.runDir) {
-        writeDebugArtifacts(input.runDir, request, result, null, attempt + 1);
+      if (input.runDir) {
+        writeDispatchArtifacts(input.runDir, request, result, null, attempt + 1);
       }
+      logAssistantText(
+        `[verify-pr-author] dispatch attempt ${attempt + 1} (model ${request.model})`,
+        assistantText
+      );
       return result;
     } catch (err: unknown) {
       lastErr = err;
       const status = (err as { status?: number })?.status;
       const retryable = typeof status === 'number' && RETRYABLE_STATUSES.has(status);
-      if (isDebugEnabled() && input.runDir) {
-        writeDebugArtifacts(input.runDir, request, null, err, attempt + 1);
+      if (input.runDir) {
+        writeDispatchArtifacts(input.runDir, request, null, err, attempt + 1);
       }
       if (!retryable || attempt === MAX_TRANSPORT_ATTEMPTS - 1) {
         throw err;
