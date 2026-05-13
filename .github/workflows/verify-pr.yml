@@ -785,11 +785,70 @@ jobs:
           fi
           # shellcheck disable=SC2012
           RESULT=$(ls -t "$PR_HEAD_DIR"/.verify-output/*/verify-result.json | head -1)
+
+          # Aggregate token usage across every Claude dispatch in this
+          # run — recipe-author (initial + retry) and evidence-check
+          # (initial + retry-after-verified). Each call persists a
+          # {model, usage, assistantText} JSON to its run dir via
+          # agent-dispatch.ts / verify-evidence-check.ts. We glob all of
+          # them and sum, then apply Anthropic's published per-million
+          # token prices to get a dollar estimate. Costs are best-effort:
+          # the price table is hardcoded so a price change requires a
+          # workflow edit (Anthropic's pricing is stable enough that
+          # this is acceptable for v8 prioritisation telemetry).
+          USAGE_FILES=()
+          while IFS= read -r f; do
+            [ -n "$f" ] && USAGE_FILES+=("$f")
+          done < <(
+            find "$PR_HEAD_DIR/.verify-output" -type f \
+              \( -name 'dispatch-response.json' -o -name 'evidence-check-response.json' \) \
+              2>/dev/null | sort
+          )
+          if [ ${#USAGE_FILES[@]} -eq 0 ]; then
+            USAGE_JSON='{"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":"0.000000","dispatch_count":0}'
+          else
+            USAGE_JSON=$(jq -s '
+              def prices:
+                {
+                  "claude-sonnet-4-5":     {"i": 3.00,  "o": 15.00, "cr": 0.30, "cw": 3.75},
+                  "claude-haiku-4-5":      {"i": 0.80,  "o": 4.00,  "cr": 0.08, "cw": 1.00},
+                  "claude-opus-4-7":       {"i": 15.00, "o": 75.00, "cr": 1.50, "cw": 18.75}
+                };
+              # Strip trailing -YYYYMMDD date suffix that Anthropic
+              # ships alongside the rolling alias (e.g. claude-haiku-4-5
+              # -20251001 → claude-haiku-4-5).
+              def model_key($m):
+                ($m // "") | sub("-2025[0-9]+$"; "") | sub("-2026[0-9]+$"; "");
+              reduce .[] as $r (
+                {input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, cost_usd: 0, dispatch_count: 0};
+                ($r.usage // {}) as $u
+                | (prices[model_key($r.model)] // {"i":0,"o":0,"cr":0,"cw":0}) as $p
+                | (
+                    ($u.input_tokens // 0) * $p.i +
+                    ($u.output_tokens // 0) * $p.o +
+                    ($u.cache_read_input_tokens // 0) * $p.cr +
+                    ($u.cache_creation_input_tokens // 0) * $p.cw
+                  ) / 1000000 as $c
+                | {
+                    input_tokens: (.input_tokens + ($u.input_tokens // 0)),
+                    output_tokens: (.output_tokens + ($u.output_tokens // 0)),
+                    cache_read_tokens: (.cache_read_tokens + ($u.cache_read_input_tokens // 0)),
+                    cache_write_tokens: (.cache_write_tokens + ($u.cache_creation_input_tokens // 0)),
+                    cost_usd: (.cost_usd + $c),
+                    dispatch_count: (.dispatch_count + 1)
+                  }
+              )
+              | .cost_usd |= (. * 1000000 | round / 1000000 | tostring)
+            ' "${USAGE_FILES[@]}")
+          fi
+          echo "telemetry usage: $USAGE_JSON"
+
           PAYLOAD=$(jq -nc \
             --arg token "$TELEMETRY_TOKEN" \
             --arg run_id "$RUN_ID" \
             --arg pr "$PR_NUMBER" \
-            --slurpfile result "$RESULT" '
+            --slurpfile result "$RESULT" \
+            --argjson usage "$USAGE_JSON" '
               ($result[0]) as $r
               | {
                   token: $token,
@@ -802,6 +861,12 @@ jobs:
                   unit_tests_ran: (($r.unitTests.ran // false) | tostring),
                   unit_tests_passed: (($r.unitTests.passed // "n/a") | tostring),
                   duration_ms: (($r.durations.totalMs // 0) | tostring),
+                  input_tokens: ($usage.input_tokens | tostring),
+                  output_tokens: ($usage.output_tokens | tostring),
+                  cache_read_tokens: ($usage.cache_read_tokens | tostring),
+                  cache_write_tokens: ($usage.cache_write_tokens | tostring),
+                  cost_usd: $usage.cost_usd,
+                  dispatch_count: ($usage.dispatch_count | tostring),
                   timestamp: ($r.createdAt // (now | todate))
                 }
             ')
