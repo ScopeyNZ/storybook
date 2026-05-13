@@ -258,7 +258,21 @@ jobs:
           {
             "network": {
               "allowLocalBinding": true,
-              "allowedDomains": ["localhost", "127.0.0.1"],
+              "allowedDomains": [
+                "localhost",
+                "127.0.0.1",
+                "registry.yarnpkg.com",
+                "registry.npmjs.org",
+                "registry.npmjs.com",
+                "registry.npm.taobao.org",
+                "objects.githubusercontent.com",
+                "playwright.azureedge.net",
+                "playwright-akamai.azureedge.net",
+                "playwright-verizon.azureedge.net",
+                "cdn.playwright.dev",
+                "azureedge.net",
+                "*.fastly.net"
+              ],
               "deniedDomains": ["*"]
             },
             "filesystem": {
