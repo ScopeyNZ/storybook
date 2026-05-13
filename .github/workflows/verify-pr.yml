@@ -40,6 +40,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -54,6 +56,14 @@ jobs:
           mv "$GITHUB_WORKSPACE/_base"/* "$GITHUB_WORKSPACE/"
           rmdir "$GITHUB_WORKSPACE/_base"
           shopt -u dotglob
+          # Fetch BASE_SHA + PR_HEAD_SHA into the base workspace so the
+          # `verify-pr-generate --base-sha … --head-sha …` UX2 diff
+          # computation can resolve both objects locally. The branch-tip
+          # clone above only guarantees BASE_REF's HEAD, which may differ
+          # from BASE_SHA if the base branch moved between PR-open and the
+          # workflow firing.
+          git -C "$GITHUB_WORKSPACE" -c protocol.version=2 \
+            fetch --no-tags --depth=1 origin "$BASE_SHA" "$PR_HEAD_SHA"
           # Drop the authenticated remote URL so untrusted yarn / nx scripts
           # that walk to .git/config never see the token, matching
           # persist-credentials:false on actions/checkout.
