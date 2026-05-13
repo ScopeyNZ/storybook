@@ -27,21 +27,39 @@ jobs:
         uses: prince-chrismc/check-actor-permissions-action@d504e74ba31658f4cdf4fcfeb509d4c09736d88e # v3.0.2
         with:
           permission: write
-      - name: Checkout base
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          # see RUNBOOK.md §base-checkout-ref-pinning
-          ref: ${{ github.event.pull_request.base.ref }}
-          # Do not persist the actions/checkout token into .git/config — keeps
-          # GITHUB_TOKEN out of any subprocess that subsequently runs `git`
-          # inside the workspace (untrusted yarn install / nx compile scripts).
-          persist-credentials: false
-      - name: Scrub any residual checkout credentials
-        # Belt-and-suspenders for persist-credentials:false — if the base
-        # checkout ever wrote an Authorization header into .git/config under
-        # an old runner image, drop it now before any untrusted code runs.
+      - name: Checkout base (manual clone — no token persistence)
+        # Manual git clone instead of actions/checkout because the repo
+        # carries gitlinks (.external/addon-svelte-csf etc.) without a
+        # corresponding .gitmodules entry. actions/checkout's "Removing
+        # auth" cleanup walks the submodule tree under
+        # persist-credentials:false and aborts with
+        #   fatal: No url found for submodule path '.external/...'
+        # The manual clone never writes credentials into .git/config and
+        # never walks .gitmodules, so we get persist-credentials:false
+        # semantics without the cleanup-walk crash.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          REPO: ${{ github.repository }}
         run: |
-          git config --unset-all http.https://github.com/.extraheader || true
+          set -euo pipefail
+          git -c protocol.version=2 clone \
+            --no-tags --depth=1 --branch "$BASE_REF" \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git" \
+            "$GITHUB_WORKSPACE/_base"
+          # Move clone contents into $GITHUB_WORKSPACE in place. actions/checkout
+          # would have done this automatically; replicate so downstream steps
+          # see the repo at the workspace root.
+          shopt -s dotglob
+          mv "$GITHUB_WORKSPACE/_base"/* "$GITHUB_WORKSPACE/"
+          rmdir "$GITHUB_WORKSPACE/_base"
+          shopt -u dotglob
+          # Drop the authenticated remote URL so untrusted yarn / nx scripts
+          # that walk to .git/config never see the token, matching
+          # persist-credentials:false on actions/checkout.
+          git -C "$GITHUB_WORKSPACE" remote set-url origin "https://github.com/${REPO}.git"
+          git -C "$GITHUB_WORKSPACE" config --local --unset-all credential.helper 2>/dev/null || true
+          git -C "$GITHUB_WORKSPACE" config --local --unset-all http.https://github.com/.extraheader 2>/dev/null || true
       - name: Setup Node.js and Install Dependencies
         uses: ./.github/actions/setup-node-and-install
         with:
