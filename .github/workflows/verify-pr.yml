@@ -84,6 +84,32 @@ jobs:
         # level — this is the canonical workaround.
         run: echo "PR_HEAD_DIR=${{ runner.temp }}/pr-head" >> "$GITHUB_ENV"
 
+      - name: Init provenance secret
+        # UC15: generate a per-run random VERIFY_PROVENANCE_SECRET so the
+        # recipe-author HMAC ↔ verify-pr load-time HMAC verification has a
+        # shared key without requiring a repo-level GitHub secret. Per-run
+        # randomness is sufficient: the secret only needs to bind the spec
+        # produced by the trusted authoring step to the spec executed by the
+        # subsequent verify step — both happen in the same job before any
+        # untrusted code runs.
+        #
+        # `secrets.VERIFY_PROVENANCE_SECRET` (if configured at repo/org
+        # level) overrides the random value so users who want stable replay
+        # verification across runs can opt in.
+        run: |
+          set -euo pipefail
+          INHERITED='${{ secrets.VERIFY_PROVENANCE_SECRET }}'
+          if [ -n "$INHERITED" ]; then
+            SECRET="$INHERITED"
+          else
+            SECRET="$(openssl rand -hex 32)"
+          fi
+          # Stays in $GITHUB_ENV only for trusted steps — every untrusted
+          # `env -i` envelope below redirects $GITHUB_ENV to a throwaway
+          # sink under $RUNNER_TEMP, so untrusted code never reads this.
+          echo "::add-mask::$SECRET"
+          echo "VERIFY_PROVENANCE_SECRET=$SECRET" >> "$GITHUB_ENV"
+
       - name: Checkout PR head (untrusted execution context)
         # Manual git clone instead of actions/checkout because the repo carries
         # gitlinks (.external/addon-svelte-csf etc.) without a .gitmodules file,
