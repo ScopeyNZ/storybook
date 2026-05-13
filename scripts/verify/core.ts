@@ -93,6 +93,11 @@ export async function writeResult(
   outputDir?: string
 ): Promise<void> {
   const resultJson = outputDir ? path.join(outputDir, 'verify-result.json') : paths.resultJson;
+  // [debug-c5] remove after C5 trusted-path threading is verified.
+   
+  console.log(
+    `[verify][debug-c5] writeResult outputDir=${JSON.stringify(outputDir)} resultJson=${JSON.stringify(resultJson)}`
+  );
   await fs.mkdir(path.dirname(resultJson), { recursive: true });
   await fs.writeFile(resultJson, JSON.stringify(result, null, 2) + '\n', 'utf-8');
 }

@@ -199,6 +199,10 @@ async function main(argv: string[]): Promise<number> {
   const explicitOutputDir = process.env.VERIFY_RESULT_PATH
     ? path.dirname(process.env.VERIFY_RESULT_PATH)
     : undefined;
+  // [debug-c5] remove after C5 trusted-path threading is verified.
+  console.log(
+    `[verify][debug-c5] VERIFY_RESULT_PATH=${JSON.stringify(process.env.VERIFY_RESULT_PATH)} explicitOutputDir=${JSON.stringify(explicitOutputDir)} paths.resultJson=${JSON.stringify(paths.resultJson)}`
+  );
 
   await pruneOldRuns();
   await ensureRunDir(paths);
