@@ -863,13 +863,13 @@ jobs:
                 | (num($u.input_tokens)) as $in_tok
                 | (num($u.output_tokens)) as $out_tok
                 | (num($u.cache_read_input_tokens)) as $cr_tok
-                | (
+                | ((
                     $in_tok  * $p.i  +
                     $out_tok * $p.o  +
                     $cr_tok  * $p.cr +
                     $cw5_tok * $p.cw5 +
                     $cw1_tok * $p.cw1
-                  ) / 1000000 as $c
+                  ) / 1000000) as $c
                 | {
                     input_tokens: (.input_tokens + $in_tok),
                     output_tokens: (.output_tokens + $out_tok),
