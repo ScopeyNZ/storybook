@@ -757,75 +757,71 @@ jobs:
           echo "EOF" >> "$GITHUB_OUTPUT"
 
       - name: Append telemetry
-        # Append one CSV row per run to telemetry.csv on the
-        # _verify-screenshots side branch. After 10–20 PRs we can answer:
-        # verified-first-try % vs after-retry vs regression, vision
-        # false-negative rate, sandbox-path vs internal-ui breakdown,
-        # duration distribution. Drives v8 prioritisation.
+        # POST one row per run to a Google Apps Script web app that
+        # appends to a Sheet (sheet schema: run_id, pr_number, verdict,
+        # target, evidence_verdict, evidence_retry, unit_tests_ran,
+        # unit_tests_passed, duration_ms, timestamp). After 10–20 PRs we
+        # can answer: verified-first-try % vs after-retry vs regression,
+        # vision false-negative rate, sandbox-path vs internal-ui
+        # breakdown, duration distribution. Drives v8 prioritisation.
+        #
+        # No-ops when the webhook secrets aren't configured so forks
+        # without telemetry sinks don't fail this step.
         if: always() && steps.verdict.outputs.verdict != '' && steps.verdict.outputs.verdict != 'missing'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           RUN_ID: ${{ github.run_id }}
-          REPO: ${{ github.repository }}
+          TELEMETRY_URL: ${{ secrets.TELEMETRY_AGENTIC_VERIFICATION_WEBHOOK_URL }}
+          TELEMETRY_TOKEN: ${{ secrets.TELEMETRY_AGENTIC_VERIFICATION_WEBHOOK_TOKEN }}
         run: |
           set -euo pipefail
+          if [ -z "${TELEMETRY_URL:-}" ] || [ -z "${TELEMETRY_TOKEN:-}" ]; then
+            echo "telemetry webhook not configured — skipping"
+            exit 0
+          fi
           if ! compgen -G "$PR_HEAD_DIR/.verify-output/*/verify-result.json" >/dev/null; then
             echo "no verify-result.json — skipping telemetry"
             exit 0
           fi
           # shellcheck disable=SC2012
           RESULT=$(ls -t "$PR_HEAD_DIR"/.verify-output/*/verify-result.json | head -1)
-          ROW=$(jq -r --arg run_id "$RUN_ID" --arg pr "$PR_NUMBER" '[
-            $run_id,
-            $pr,
-            .verdict,
-            (.template // "n/a"),
-            (.evidenceVerdict // "n/a"),
-            ((.evidenceRetry // false) | tostring),
-            ((.unitTests.ran // false) | tostring),
-            ((.unitTests.passed // "n/a") | tostring),
-            ((.durations.totalMs // 0) | tostring),
-            (.createdAt // (now | todate))
-          ] | @csv' "$RESULT")
-          echo "telemetry row: $ROW"
+          PAYLOAD=$(jq -nc \
+            --arg token "$TELEMETRY_TOKEN" \
+            --arg run_id "$RUN_ID" \
+            --arg pr "$PR_NUMBER" \
+            --slurpfile result "$RESULT" '
+              ($result[0]) as $r
+              | {
+                  token: $token,
+                  run_id: $run_id,
+                  pr_number: $pr,
+                  verdict: $r.verdict,
+                  target: ($r.template // "n/a"),
+                  evidence_verdict: ($r.evidenceVerdict // "n/a"),
+                  evidence_retry: (($r.evidenceRetry // false) | tostring),
+                  unit_tests_ran: (($r.unitTests.ran // false) | tostring),
+                  unit_tests_passed: (($r.unitTests.passed // "n/a") | tostring),
+                  duration_ms: (($r.durations.totalMs // 0) | tostring),
+                  timestamp: ($r.createdAt // (now | todate))
+                }
+            ')
+          # Log a token-redacted preview so the row is debuggable from
+          # the Action log without leaking the shared secret.
+          jq 'del(.token)' <<<"$PAYLOAD"
 
-          AUTH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
-          CLONE="$RUNNER_TEMP/telemetry-branch"
-          rm -rf "$CLONE"
-          # Push screenshots step created the orphan branch if it was
-          # missing; if Push screenshots was skipped (e.g. no screenshots),
-          # fall back to orphan-create here so telemetry still lands.
-          if ! git -c protocol.version=2 clone --depth 1 --branch _verify-screenshots \
-              "$AUTH_URL" "$CLONE" 2>/dev/null; then
-            echo "side branch missing — bootstrapping for telemetry"
-            git -c protocol.version=2 clone --depth 1 "$AUTH_URL" "$CLONE"
-            (
-              cd "$CLONE"
-              git -c user.email=actions@github.com -c user.name="github-actions[bot]" \
-                checkout --orphan _verify-screenshots
-              git rm -rf . >/dev/null
-              echo "Verify harness screenshot store. Auto-managed; do not edit." > README.md
-              git add README.md
-              git -c user.email=actions@github.com -c user.name="github-actions[bot]" \
-                commit -m "chore: init _verify-screenshots branch"
-              git push origin _verify-screenshots
-            )
+          # Apps Script web apps redirect /exec → /usercontent; curl -L
+          # follows. -f makes non-2xx a hard error. --max-time bounds the
+          # call so a hung deployment doesn't stall the workflow.
+          RESPONSE=$(curl -sS -fL --max-time 30 \
+            -X POST \
+            -H 'Content-Type: application/json' \
+            --data-binary "$PAYLOAD" \
+            "$TELEMETRY_URL")
+          echo "telemetry response: $RESPONSE"
+          if ! jq -e '.ok == true' >/dev/null <<<"$RESPONSE"; then
+            echo "telemetry rejected: $RESPONSE" >&2
+            exit 1
           fi
-          cd "$CLONE"
-          if [ ! -f telemetry.csv ]; then
-            echo "run_id,pr_number,verdict,target,evidence_verdict,evidence_retry,unit_tests_ran,unit_tests_passed,duration_ms,timestamp" > telemetry.csv
-          fi
-          echo "$ROW" >> telemetry.csv
-          git -c user.email=actions@github.com -c user.name="github-actions[bot]" \
-            add telemetry.csv
-          if git diff --cached --quiet; then
-            echo "telemetry row already present — skipping push"
-            exit 0
-          fi
-          git -c user.email=actions@github.com -c user.name="github-actions[bot]" \
-            commit -m "telemetry: PR #${PR_NUMBER} run ${RUN_ID}"
-          git push origin _verify-screenshots
 
       - name: Stage artifacts (rename dotdirs)
         # actions/upload-artifact v7 ships dotfiles into the zip, but
