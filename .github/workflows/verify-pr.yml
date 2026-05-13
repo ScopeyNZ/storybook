@@ -895,11 +895,15 @@ jobs:
           # the Action log without leaking the shared secret.
           jq 'del(.token)' <<<"$PAYLOAD"
 
-          # Apps Script web apps redirect /exec → /usercontent; curl -L
-          # follows. -f makes non-2xx a hard error. --max-time bounds the
-          # call so a hung deployment doesn't stall the workflow.
+          # Apps Script /exec POST returns 302 → script.googleusercontent.com
+          # /macros/echo where the response body lives. curl -L follows;
+          # crucially we DO NOT pass -X POST — that flag forces the method
+          # on EVERY request including the redirect, which makes the second
+          # hop POST to /echo and 405s. --data-binary alone implies POST
+          # for the first request, then curl downgrades to GET for the
+          # redirect (RFC 7231 §6.4.3 default). -f makes non-2xx a hard
+          # error. --max-time bounds the call.
           RESPONSE=$(curl -sS -fL --max-time 30 \
-            -X POST \
             -H 'Content-Type: application/json' \
             --data-binary "$PAYLOAD" \
             "$TELEMETRY_URL")
