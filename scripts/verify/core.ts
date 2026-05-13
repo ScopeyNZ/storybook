@@ -151,7 +151,8 @@ export function computeVerdict(tests: RecipeTest[]): 'verified' | 'regression' {
   }
   for (const t of tests) {
     if (t.status !== 'passed') return 'regression';
-    if (t.pageErrors.length > 0) return 'regression';
+    const significantPageErrors = t.pageErrors.filter((m) => !isLowSignalPageError(m));
+    if (significantPageErrors.length > 0) return 'regression';
     const significantConsoleErrors = t.consoleErrors.filter((m) => !isLowSignalConsoleError(m));
     if (significantConsoleErrors.length > 0) return 'regression';
   }
@@ -168,6 +169,20 @@ export function computeVerdict(tests: RecipeTest[]): 'verified' | 'regression' {
  */
 function isLowSignalConsoleError(text: string): boolean {
   return /^Failed to load resource:/.test(text);
+}
+
+/**
+ * Low-signal pageErrors that surface on the manager page through
+ * environment quirks rather than the PR's diff:
+ *  - `SecurityError: Failed to read the 'sessionStorage' property from
+ *    'Window': Access is denied for this document.` — `@storybook/addon-mcp`
+ *    probes cross-origin composed refs (e.g. chromatic-hosted iframes) and
+ *    triggers a Window.sessionStorage getter denial. Pre-existing in the
+ *    upstream addon; surfaced only when internal-ui loads composed refs.
+ *    Real PR regressions do not surface this way.
+ */
+function isLowSignalPageError(text: string): boolean {
+  return /SecurityError:\s*Failed to read the 'sessionStorage' property from 'Window'/.test(text);
 }
 
 export interface ParsedReport {
