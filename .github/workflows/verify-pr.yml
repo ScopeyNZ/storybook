@@ -347,28 +347,15 @@ jobs:
           : > "$SINK_GITHUB_ENV"
           : > "$SINK_GITHUB_PATH"
           : > "$SINK_GITHUB_OUTPUT"
-          # Disable postinstall lifecycle scripts in the PR-head workspace —
-          # malicious package.json `postinstall` hooks would otherwise run
-          # under yarn install before srt wraps anything. The override is a
-          # local .yarnrc.yml fragment merged with the head's own config;
-          # `enableScripts: false` is the documented Yarn Berry knob.
-          cat > "$PR_HEAD_DIR/.yarnrc.override.yml" <<'YRC'
-          enableScripts: false
-          YRC
-          # Loosened FS allowlist for install/compile: yarn pulls from the
-          # global cache (~/.cache/yarn) and playwright writes its binary
-          # under ~/.cache/ms-playwright. Both are already covered by the
-          # $HOME/.cache entry in allowWrite; we explicitly mention them
-          # in this comment so future hardening passes don't try to remove
-          # the parent without restoring per-tool subpaths.
           # env -i strips every non-allowlisted var so ACTIONS_* tokens
           # cannot leak even if `unset` is bypassed by subshell quoting.
           # NOT srt-wrapped: yarn install needs registry.yarnpkg.com /
           # registry.npmjs.org access, and srt's default-deny network
           # policy rejects DNS for non-allowlisted hosts. The other C2
           # protections (env scrub, $GITHUB_ENV/$PATH/$OUTPUT sinks,
-          # persist-credentials:false, lifecycle-scripts:false) still
-          # apply.
+          # persist-credentials:false) still apply. YARN_ENABLE_SCRIPTS=false
+          # disables postinstall hooks so a malicious `postinstall` in a PR
+          # dependency cannot do exfil during install.
           env -i \
             HOME="$HOME" \
             PATH="$PATH" \
@@ -378,9 +365,12 @@ jobs:
             GITHUB_ENV="$SINK_GITHUB_ENV" \
             GITHUB_PATH="$SINK_GITHUB_PATH" \
             GITHUB_OUTPUT="$SINK_GITHUB_OUTPUT" \
-            YARN_RC_FILENAME="$PR_HEAD_DIR/.yarnrc.override.yml" \
+            YARN_ENABLE_SCRIPTS=false \
             yarn install --immutable
           # Playwright browser binaries (azureedge.net CDN). Same env scrub.
+          # YARN_ENABLE_SCRIPTS intentionally NOT set false here — playwright
+          # install legitimately runs a postinstall to download the chromium
+          # binary; without it the recipe step has no browser.
           env -i \
             HOME="$HOME" \
             PATH="$PATH" \
