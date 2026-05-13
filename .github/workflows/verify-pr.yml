@@ -174,13 +174,11 @@ jobs:
           # Post-install integrity check. EXPECTED_SRT_SHA is the sha256 of
           # the resolved `srt` shim at the pinned version above. Bump
           # procedure: see scripts/verify/SECURITY.md §pinning-sandbox-runtime.
-          # FAIL-CLOSED: owner MUST populate EXPECTED_SRT_SHA below before
-          # merging. A literal "TBD-OWNER-FILL" placeholder aborts the run.
-          EXPECTED_SRT_SHA="TBD-OWNER-FILL"
-          if [ "$EXPECTED_SRT_SHA" = "TBD-OWNER-FILL" ]; then
-            echo "[srt] EXPECTED_SRT_SHA is unpinned (TBD-OWNER-FILL) — owner must populate before merge" >&2
-            exit 1
-          fi
+          # FAIL-CLOSED: pinned sha256 of the srt shim at the version above.
+          # Bump procedure: re-run .github/workflows/_srt-sha-probe.yml after
+          # bumping the srt version and paste the value emitted by the probe
+          # job into the literal below.
+          EXPECTED_SRT_SHA="36de38197ac22991c8c9edead4d6184914c8b786e040ecf27bdcf26abd166338"
           actual=$(sha256sum "$(which srt)" | cut -d' ' -f1)
           if [ "$actual" != "$EXPECTED_SRT_SHA" ]; then
             echo "srt sha mismatch — expected=$EXPECTED_SRT_SHA actual=$actual" >&2
