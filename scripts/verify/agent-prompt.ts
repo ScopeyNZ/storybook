@@ -40,7 +40,11 @@ export interface PromptInput {
   authoringGuide?: string;
 }
 
-const PROMPT_TOKEN_BUDGET = 20_000;
+// Bump from 20k → 40k to accommodate large multi-file diffs (Angular
+// stats.json PR #21 hit 37k after target-suggestion + retry-context
+// appends). 40k input tokens × Opus $15/MTok = $0.60 input cost, still
+// well under the $2 per-run cost gate enforced in agent-dispatch.
+const PROMPT_TOKEN_BUDGET = 40_000;
 
 // B4 (H4): caps for attacker-controlled fields. Title fits in a couple of
 // lines, body holds the long-form PR description, retry-context holds a
