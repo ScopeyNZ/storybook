@@ -264,16 +264,13 @@ jobs:
                 "registry.yarnpkg.com",
                 "registry.npmjs.org",
                 "registry.npmjs.com",
-                "registry.npm.taobao.org",
                 "objects.githubusercontent.com",
                 "playwright.azureedge.net",
                 "playwright-akamai.azureedge.net",
                 "playwright-verizon.azureedge.net",
-                "cdn.playwright.dev",
-                "azureedge.net",
-                "*.fastly.net"
+                "cdn.playwright.dev"
               ],
-              "deniedDomains": ["*"]
+              "deniedDomains": []
             },
             "filesystem": {
               "allowRead": [],
