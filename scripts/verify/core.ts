@@ -38,6 +38,12 @@ export interface VerifyResult {
   verdict: 'verified' | 'regression' | 'skipped';
   regressionReason?: string;
   /**
+   * Long-form context for the regression (compile/boot output tail, error
+   * trace, etc). Rendered by the PR-comment formatter inside a collapsible
+   * `<details>` block when present.
+   */
+  regressionDetails?: string;
+  /**
    * v6 widened: `internal-ui` (default monorepo-UI target) or a sandbox
    * template such as `react-vite/default-ts`.
    */
@@ -91,7 +97,13 @@ export async function writeResult(paths: RunPaths, result: VerifyResult): Promis
 export async function writeRegressionResult(
   paths: RunPaths,
   reason: string,
-  opts?: { template?: string }
+  opts?: {
+    template?: string;
+    /** Long-form context (compile/boot output tail) for the PR comment. */
+    details?: string;
+    recipeSpecPath?: string;
+    durations?: Durations;
+  }
 ): Promise<void> {
   const result: VerifyResult = {
     schemaVersion: SCHEMA_VERSION,
@@ -100,12 +112,21 @@ export async function writeRegressionResult(
     regressionReason: reason,
     template: opts?.template ?? 'internal-ui',
     storyIds: [],
-    recipeSpecPath: '',
+    recipeSpecPath: opts?.recipeSpecPath ?? '',
     tests: [],
     traceZipPaths: [],
-    durations: { compileMs: 0, symlinkMs: 0, bootMs: 0, recipeMs: 0, totalMs: 0 },
+    durations: opts?.durations ?? {
+      compileMs: 0,
+      symlinkMs: 0,
+      bootMs: 0,
+      recipeMs: 0,
+      totalMs: 0,
+    },
     createdAt: new Date().toISOString(),
   };
+  if (opts?.details && opts.details.length > 0) {
+    result.regressionDetails = opts.details;
+  }
   await writeResult(paths, result);
 }
 

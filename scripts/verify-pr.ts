@@ -27,6 +27,7 @@ import {
   ensureRunDir,
   parsePlaywrightReport,
   pruneOldRuns,
+  writeRegressionResult,
   writeResult,
 } from './verify/core.ts';
 import type { VerifyResult } from './verify/core.ts';
@@ -85,6 +86,15 @@ function resolveRecipeSpec(flagValue: string | undefined, positional?: string): 
 
 function templateLabel(target: VerifyTarget): string {
   return target.kind === 'sandbox' ? target.template : 'internal-ui';
+}
+
+// CSI / SGR ANSI escape stripper. Matches the inline `sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g'`
+// used by the workflow's compile-failure stub so boot-error tails read cleanly
+// in the PR comment.
+
+const ANSI_RE = /\[[0-9;]*[A-Za-z]/g;
+function stripAnsi(input: string): string {
+  return input.replace(ANSI_RE, '');
 }
 
 interface RunResyncArgs {
@@ -238,23 +248,53 @@ async function main(argv: string[]): Promise<number> {
   let symlinkMs: number | undefined;
   let bootMs: number;
 
-  if (target.kind === 'internal-ui') {
-    const handle = await bootInternalUi({ port, controller });
-    bootMs = handle.bootMs;
-  } else {
-    const sandboxDir = resolveSandboxDir(target.template as 'react-vite/default-ts');
+  try {
+    if (target.kind === 'internal-ui') {
+      const handle = await bootInternalUi({ port, controller });
+      bootMs = handle.bootMs;
+    } else {
+      const sandboxDir = resolveSandboxDir(target.template as 'react-vite/default-ts');
 
-    if (flags.resync) {
-      return runResync({ recipeSpec, baseURL, port, sandboxDir, totalStart });
+      if (flags.resync) {
+        return runResync({ recipeSpec, baseURL, port, sandboxDir, totalStart });
+      }
+
+      await snapshotSandbox(sandboxDir);
+      await sanitizeResolutions(sandboxDir);
+      const sync = await syncCorePackage({ sandboxDir });
+      compileMs = sync.compileMs;
+      symlinkMs = sync.symlinkMs;
+      const boot = await bootStorybook({ sandboxDir, port, controller });
+      bootMs = boot.bootMs;
     }
-
-    await snapshotSandbox(sandboxDir);
-    await sanitizeResolutions(sandboxDir);
-    const sync = await syncCorePackage({ sandboxDir });
-    compileMs = sync.compileMs;
-    symlinkMs = sync.symlinkMs;
-    const boot = await bootStorybook({ sandboxDir, port, controller });
-    bootMs = boot.bootMs;
+  } catch (err) {
+    // Boot path failed (compile-in-dev-server crash, sandbox sync error,
+    // waitForUrl timeout, etc). Without a stub, the workflow short-circuits
+    // before writing verify-result.json and the PR comment renders
+    // "No verdict produced" — misleading: the real verdict is regression.
+    // Mirror the workflow's compile-failure stub (verify-pr.yml's
+    // `write_compile_failure_stub`): write a regression verdict with the
+    // error tail so the PR comment renders the cause in its <details>
+    // block. Abort the controller so any spawned dev-server child is
+    // torn down.
+    controller.abort();
+    const message = err instanceof Error ? (err.stack ?? err.message) : String(err);
+    const details = stripAnsi(message).slice(-4000);
+    await writeRegressionResult(paths, 'boot failure (see regressionDetails)', {
+      template: templateLabel(target),
+      details,
+      recipeSpecPath: recipeSpec,
+      durations: {
+        compileMs,
+        symlinkMs,
+        bootMs: undefined,
+        recipeMs: undefined,
+        totalMs: performance.now() - totalStart,
+      },
+    });
+    console.error(`[verify] boot failed — wrote regression stub to ${paths.resultJson}`);
+    console.error(details);
+    return 1;
   }
 
   let reportPath: string;
