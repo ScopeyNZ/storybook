@@ -25,6 +25,8 @@ import { performance } from 'node:perf_hooks';
 
 import waitOn from 'wait-on';
 
+import { pickEnv } from '../utils/env.ts';
+
 const repoRoot = path.resolve(import.meta.dirname, '..', '..');
 const codeDir = path.join(repoRoot, 'code');
 const dispatcherJs = path.join(codeDir, 'core', 'dist', 'bin', 'dispatcher.js');
@@ -47,11 +49,22 @@ export async function bootInternalUi(opts: {
       cwd: codeDir,
       stdio: ['ignore', 'pipe', 'pipe'],
       signal: opts.controller.signal,
-      env: {
-        ...process.env,
-        NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --max_old_space_size=4096`.trim(),
-        STORYBOOK_DISABLE_TELEMETRY: '1',
-      },
+      env: pickEnv({
+        allow: [
+          'PATH',
+          'HOME',
+          'RUNNER_TEMP',
+          'VERIFY_RUN_DIR',
+          'STORYBOOK_URL',
+          'NODE_OPTIONS',
+          'CI',
+          'NODE_ENV',
+        ],
+        extra: {
+          NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --max_old_space_size=4096`.trim(),
+          STORYBOOK_DISABLE_TELEMETRY: '1',
+        },
+      }),
     }
   );
 

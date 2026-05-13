@@ -235,7 +235,7 @@ Print the failure cause + the `result.json` path on stop:
 
 - This skill runs inside Claude Code; it uses `Agent`, `Read`, `Write`, `Bash`, and `Edit` tools.
 - All paths in invocations are absolute. Lint commands `cd code` via `yarn --cwd`.
-- Max attempts = `RECIPE_RETRY_POLICY.maxAttempts` (currently 2). Read the value from `scripts/verify/recipe-retry-policy.ts` — do not hardcode.
+- Max attempts = `MAX_RECIPE_ATTEMPTS` (currently 2). Read the value from `scripts/verify/recipe-author-core.ts` — do not hardcode.
 - The skill **never executes** the generated spec. The human review gate (Phase-1 lethal-trifecta breaker) is preserved.
 - Deny-regex hits are not retried — they are security signals, not lint nits.
 - Cap retry feedback at 5 errors (R3).

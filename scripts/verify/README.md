@@ -208,10 +208,9 @@ scripts/
     ├── boot.ts               # Port preflight, signal handlers, spawn sandbox storybook (sandbox target)
     ├── triage.ts             # triageReferenceSpecs(changedPaths) — glob matching via minimatch
     ├── agent-prompt.ts       # buildRecipeAuthorPrompt(...) — assembles the prompt bundle sections
-    ├── recipe-author-core.ts # Shared local/CI recipe-author core
+    ├── recipe-author-core.ts # Shared local/CI recipe-author core (incl. retry policy)
     ├── recipe-deny.ts        # assertNoDeniedPatterns(source) — static deny-regex pass
     ├── lint-invocation.ts    # Scoped ESLint invocation for agent-generated specs
-    ├── recipe-retry-policy.ts # RECIPE_RETRY_POLICY declarative config
     ├── agent-dispatch.ts     # Direct @anthropic-ai/sdk dispatcher (CI path)
     └── recipes/
         └── triage-table.ts   # TRIAGE_ROUTES — path-glob → reference-spec mappings
@@ -237,6 +236,17 @@ scripts/
 The `internal-ui` target has no sandbox side effects — it builds
 `code/storybook-static/` and serves it; nothing in the repo tree is
 mutated outside `.verify-output/`.
+
+## Environment overrides
+
+| Variable                       | Effect                                                                                                       |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `VERIFY_AGENT_MODEL`           | Overrides the default `claude-opus-4-7[1m]` hint baked into `prompt-bundle.json` (`agentModel`).             |
+| `VERIFY_MAX_COST_USD`          | Per-run cost cap (default `$2.00`). Aborts dispatch when the estimate exceeds the cap.                       |
+| `ANTHROPIC_BASE_URL`           | Optional override; restricted to `https://*.anthropic.com/` via `assertAnthropicBaseUrl`.                    |
+| `VERIFY_PROVENANCE_SECRET`     | When set, signs the provenance header with HMAC-SHA256 so downstream tampering is detectable.                |
+| `VERIFY_PR_AUTHOR_STUB_REPLY`  | Absolute path to a fixture file used by tests; bypasses the live Anthropic call.                             |
+| `VERIFY_INCLUDE_SOURCE_DUMP`   | `1` to append full source dumps of touched non-stories files to the prompt.                                  |
 
 ## Security
 
@@ -279,10 +289,14 @@ write-permission actor. Single-round workflow shape:
    `_verify-screenshots` side branch, upload artefacts, post PR
    comment with verdict + inline screenshots.
 
-The runner is a stock GitHub Actions ephemeral VM — same isolation
-profile as existing Storybook PR CI. The authored spec lives inside the
-ephemeral runner workspace only; it is uploaded as part of the artefact
-bundle for replay but never committed to any branch.
+The runner is a GitHub Actions ephemeral VM, but every PR-controlled
+step (install, compile, recipe execution) runs inside
+`@anthropic-ai/sandbox-runtime` (`srt`, bubblewrap on Linux) with
+`env -i` stripping runner secrets — Layer-2 isolation on top of the
+Layer-1 deny-regex + ESLint + `enableScripts: false` controls. The
+authored spec lives inside the ephemeral runner workspace only; it is
+uploaded as part of the artefact bundle for replay but never committed
+to any branch. See `scripts/verify/SECURITY.md` for the full posture.
 
 ## Increment 2 — prompt-bundle generation
 
@@ -309,7 +323,7 @@ Both share `scripts/verify/recipe-author-core.ts`:
 
 The core encapsulates: deny-regex pass, provenance header, lint
 invocation, retry-policy lookup, framed-retry emission on **exit 75**
-(stable contract — see `recipe-retry-policy.ts`), and final atomic
+(stable contract — see the inlined `ERROR_RULES` table in `recipe-author-core.ts`), and final atomic
 rename of the candidate onto `bundle.outputSpecPath` (local-dev →
 `.verify-recipes/pr-<#>.spec.ts`; CI single-round →
 `$PR_HEAD_DIR/.verify-recipes/pr-<#>.spec.ts`).

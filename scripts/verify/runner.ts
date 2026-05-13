@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 
 import type { RunPaths } from './core.ts';
+import { pickEnv } from '../utils/env.ts';
 
 export interface RunRecipeOptions {
   specPath: string;
@@ -27,11 +28,22 @@ export async function runRecipe(options: RunRecipeOptions): Promise<RunRecipeRes
   const exitCode = await new Promise<number>((resolve, reject) => {
     const child = spawn('bun', ['x', 'playwright', 'test', specPath, '--config', configPath], {
       cwd: repoRoot,
-      env: {
-        ...process.env,
-        VERIFY_RUN_DIR: runPaths.runDir,
-        STORYBOOK_URL: baseURL,
-      },
+      env: pickEnv({
+        allow: [
+          'PATH',
+          'HOME',
+          'RUNNER_TEMP',
+          'VERIFY_RUN_DIR',
+          'STORYBOOK_URL',
+          'NODE_OPTIONS',
+          'CI',
+          'NODE_ENV',
+        ],
+        extra: {
+          VERIFY_RUN_DIR: runPaths.runDir,
+          STORYBOOK_URL: baseURL,
+        },
+      }),
       signal: controller?.signal,
       stdio: ['ignore', 'pipe', 'pipe'],
     });

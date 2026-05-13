@@ -12,7 +12,7 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { RECIPE_RETRY_POLICY } from './recipe-retry-policy.ts';
+import { pickEnv } from '../utils/env.ts';
 
 const requireFromHere = createRequire(import.meta.url);
 
@@ -109,7 +109,18 @@ export async function lintRecipeSpec(
   }>((resolve, reject) => {
     const child = spawn(process.execPath, [eslintBin, ...args], {
       cwd: repoRoot,
-      env: process.env,
+      env: pickEnv({
+        allow: [
+          'PATH',
+          'HOME',
+          'RUNNER_TEMP',
+          'VERIFY_RUN_DIR',
+          'STORYBOOK_URL',
+          'NODE_OPTIONS',
+          'CI',
+          'NODE_ENV',
+        ],
+      }),
     });
     let stdoutBuf = '';
     let stderrBuf = '';
@@ -151,4 +162,7 @@ export async function lintRecipeSpec(
   };
 }
 
-export const LINT_RETRY_POLICY = RECIPE_RETRY_POLICY;
+// UC14 (PR #34762): the retry policy (max attempts, ESLint rule -> bucket
+// table, retry-message formatter) is inlined directly into
+// `recipe-author-core.ts`. The previous standalone `recipe-retry-policy.ts`
+// module was deleted; `MAX_RECIPE_ATTEMPTS` is the canonical export.

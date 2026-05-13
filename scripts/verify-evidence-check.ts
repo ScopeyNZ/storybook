@@ -17,8 +17,7 @@
 //     evidenceVerdict: 'found' | 'missing' | 'undetermined',
 //     evidenceReasoning: string,
 //     evidenceModel: string,
-//     verdict: <original> | 'evidence-missing' (if original was 'verified'
-//              and evidenceVerdict came back 'missing')
+//     notes: string[] (includes an evidence-check note when evidence is missing)
 //   }
 //
 // Exit codes:
@@ -32,10 +31,27 @@ import { parseArgs } from 'node:util';
 
 import Anthropic from '@anthropic-ai/sdk';
 
+import {
+  computeRealizedCostUsd,
+  recordDispatchCost,
+  VerifyCostBudgetError,
+} from './verify/agent-dispatch.ts';
+import { sanitizeUntrustedText } from './verify/agent-prompt.ts';
+import { assertAnthropicBaseUrl } from './verify/anthropic-env.ts';
+import { isPng } from './verify/ci/push-screenshots.ts';
+import { appendNote, type VerifyResult } from './verify/core.ts';
+
+assertAnthropicBaseUrl();
+
 const MODEL = 'claude-haiku-4-5-20251001';
 const MAX_TOKENS = 1024;
-const MAX_SCREENSHOTS = 6;
+const MAX_SCREENSHOTS = 3;
+const MAX_SCREENSHOT_BYTES = 5 * 1024 * 1024;
 const DIFF_TRUNCATE_BYTES = 64 * 1024;
+// Realistic per-call budget estimate for the vision check (haiku, 3 images
+// at ~256KB each, ~1024 output tokens). Used to gate against
+// VERIFY_MAX_COST_USD when prior dispatches have already drained the run.
+const EVIDENCE_INPUT_TOKEN_ESTIMATE = 8_000;
 
 const HELP = `
 Usage: node scripts/verify-evidence-check.ts --result <path> --diff <path> --recipe <path>
@@ -44,7 +60,7 @@ Reads verify-result.json + PR diff + authored spec, asks Claude vision whether
 the screenshots produced by the recipe visibly demonstrate the diff's change.
 Rewrites verify-result.json in place with evidence fields.
 
-Exit 1 only when evidenceVerdict === 'missing' (label step then skips).
+Exit 1 only for setup or invocation errors; evidenceVerdict is informational.
 `.trim();
 
 interface Argv {
@@ -74,6 +90,18 @@ function collectScreenshots(rootDir: string): string[] {
       if (e.isDirectory()) {
         walk(p);
       } else if (e.name.endsWith('.png')) {
+        // C12: enforce real PNG magic bytes (defence-in-depth against an
+        // arbitrary file masquerading as .png) and a 5 MB pre-base64 cap.
+        // base64 inflates by ~33% so 5 MB raw stays under the SDK's per-
+        // request payload comfort zone.
+        if (!isPng(p)) continue;
+        let size = 0;
+        try {
+          size = fs.statSync(p).size;
+        } catch {
+          continue;
+        }
+        if (size > MAX_SCREENSHOT_BYTES) continue;
         out.push(p);
       }
     }
@@ -90,21 +118,48 @@ function truncateDiff(raw: string): string {
   return raw.slice(0, DIFF_TRUNCATE_BYTES) + '\n[...diff truncated]\n';
 }
 
+// Haiku-4-5 pricing: $1/MT input, $5/MT output (Dec-2025 list price).
+const HAIKU_INPUT_USD_PER_TOKEN = 0.000001;
+const HAIKU_OUTPUT_USD_PER_TOKEN = 0.000005;
+
+function assertVisionWithinCostBudget(): void {
+  const raw = process.env.VERIFY_MAX_COST_USD;
+  if (raw === undefined) return;
+  const budgetUsd = Number(raw);
+  if (!Number.isFinite(budgetUsd) || budgetUsd < 0) {
+    throw new VerifyCostBudgetError(
+      `[evidence-check] VERIFY_MAX_COST_USD must be a non-negative number, got ${JSON.stringify(raw)}.`
+    );
+  }
+  const estimatedCostUsd =
+    EVIDENCE_INPUT_TOKEN_ESTIMATE * HAIKU_INPUT_USD_PER_TOKEN +
+    MAX_TOKENS * HAIKU_OUTPUT_USD_PER_TOKEN;
+  if (estimatedCostUsd > budgetUsd) {
+    throw new VerifyCostBudgetError(
+      `[evidence-check] estimated vision cost $${estimatedCostUsd.toFixed(
+        4
+      )} exceeds VERIFY_MAX_COST_USD cap $${budgetUsd.toFixed(2)}.`
+    );
+  }
+}
+
 function writeResult(
   resultPath: string,
-  original: Record<string, unknown>,
+  original: VerifyResult,
   evidence: EvidenceFields
 ): void {
-  const finalVerdict =
-    original.verdict === 'verified' && evidence.evidenceVerdict === 'missing'
-      ? 'evidence-missing'
-      : original.verdict;
   const merged = {
     ...original,
     ...evidence,
-    verdict: finalVerdict,
   };
+  if (evidence.evidenceVerdict === 'missing') {
+    appendNote(merged, `evidence-check: NOT FOUND (reasoning: ${evidence.evidenceReasoning})`);
+  }
   fs.writeFileSync(resultPath, JSON.stringify(merged, null, 2) + '\n', 'utf-8');
+}
+
+export function hasEvidenceMissingNote(result: Pick<VerifyResult, 'notes'>): boolean {
+  return result.notes?.some((note) => note.startsWith('evidence-check: NOT FOUND')) ?? false;
 }
 
 const SYSTEM_PROMPT = `You evaluate whether a PR's UI change is observable in screenshots produced by an automated verify-harness Playwright run.
@@ -153,7 +208,7 @@ async function main(rawArgv: string[]): Promise<number> {
   }
 
   const resultPath = flags.result;
-  const original = JSON.parse(fs.readFileSync(resultPath, 'utf-8')) as Record<string, unknown>;
+  const original = JSON.parse(fs.readFileSync(resultPath, 'utf-8')) as VerifyResult;
 
   if (original.verdict !== 'verified') {
     console.error(
@@ -214,12 +269,30 @@ async function main(rawArgv: string[]): Promise<number> {
     'Review the screenshots against the diff and answer.',
   ].join('\n');
 
+  // C11/M5: pre-call budget assertion using a realistic input-token estimate
+  // for haiku vision. Mirrors the recipe-author gate so a single run can't
+  // double-bill against VERIFY_MAX_COST_USD.
+  try {
+    assertVisionWithinCostBudget();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[evidence-check] ${msg}`);
+    writeResult(resultPath, original, {
+      evidenceVerdict: 'undetermined',
+      evidenceReasoning: `Cost budget exceeded: ${msg.slice(0, 200)}`,
+      evidenceModel: MODEL,
+    });
+    return 0;
+  }
+
   let reply: string;
   try {
     const response = await client.messages.create({
       model: MODEL,
       max_tokens: MAX_TOKENS,
-      system: SYSTEM_PROMPT,
+      // C12: cache_control on the system prompt — every PR run reuses the
+      // same prompt, so caching saves $0.0001/run on the input side.
+      system: [{ type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }],
       messages: [
         {
           role: 'user',
@@ -235,9 +308,11 @@ async function main(rawArgv: string[]): Promise<number> {
     // Surface the full vision response on stderr so reviewers can see the
     // raw reasoning live in the Action log, and persist to the run dir so
     // it lands in the uploaded artifact zip alongside verify-result.json.
+    // Sanitise LLM output before printing — strips ANSI/control chars.
+    const displayReply = sanitizeUntrustedText(reply);
     const banner = `===== [evidence-check] vision response (model ${MODEL}) =====`;
     console.error(banner);
-    console.error(reply);
+    console.error(displayReply);
     console.error('='.repeat(banner.length));
     try {
       fs.writeFileSync(
@@ -251,6 +326,19 @@ async function main(rawArgv: string[]): Promise<number> {
       );
     } catch {
       // artifact emission is best-effort
+    }
+    // C11: append realized vision cost to the run-level ledger so the next
+    // verify-pr-generate(--prior-run-dir) sees it when gating retries.
+    try {
+      recordDispatchCost(resultDir, {
+        attempt: 1,
+        model: MODEL,
+        inputTokens: Number(response.usage?.input_tokens ?? 0),
+        outputTokens: Number(response.usage?.output_tokens ?? 0),
+        costUsd: computeRealizedCostUsd(MODEL, response.usage),
+      });
+    } catch {
+      // ledger is best-effort
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

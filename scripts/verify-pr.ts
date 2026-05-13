@@ -27,6 +27,7 @@ import {
   ensureRunDir,
   parsePlaywrightReport,
   pruneOldRuns,
+  stripAnsi,
   writeRegressionResult,
   writeResult,
 } from './verify/core.ts';
@@ -88,21 +89,13 @@ function templateLabel(target: VerifyTarget): string {
   return target.kind === 'sandbox' ? target.template : 'internal-ui';
 }
 
-// CSI / SGR ANSI escape stripper. Matches the inline `sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g'`
-// used by the workflow's compile-failure stub so boot-error tails read cleanly
-// in the PR comment.
-
-const ANSI_RE = /\[[0-9;]*[A-Za-z]/g;
-function stripAnsi(input: string): string {
-  return input.replace(ANSI_RE, '');
-}
-
 interface RunResyncArgs {
   recipeSpec: string;
   baseURL: string;
   port: number;
   sandboxDir: string;
   totalStart: number;
+  explicitOutputDir?: string;
 }
 
 async function runResync(args: RunResyncArgs): Promise<number> {
@@ -161,7 +154,7 @@ async function runResync(args: RunResyncArgs): Promise<number> {
     durations: { recipeMs, totalMs: performance.now() - args.totalStart },
     createdAt: new Date().toISOString(),
   };
-  await writeResult(resyncPaths, result);
+  await writeResult(resyncPaths, result, args.explicitOutputDir);
   console.log(`[verify] resync — verdict: ${verdict} — result at ${resyncPaths.resultJson}`);
   if (traceZipPaths.length > 0) {
     console.log(`[verify] traces: ${traceZipPaths.join(', ')}`);
@@ -199,6 +192,13 @@ async function main(argv: string[]): Promise<number> {
   const baseURL = `http://localhost:${port}`;
   const totalStart = performance.now();
   const paths = buildRunPaths();
+  // When the CI workflow sets VERIFY_RESULT_PATH it owns the trusted result
+  // location outside the PR-controlled sandbox (see workflow A3 hardening).
+  // Honor it for every writeResult / writeRegressionResult call so the
+  // workflow only has to look in one place.
+  const explicitOutputDir = process.env.VERIFY_RESULT_PATH
+    ? path.dirname(process.env.VERIFY_RESULT_PATH)
+    : undefined;
 
   await pruneOldRuns();
   await ensureRunDir(paths);
@@ -230,7 +230,7 @@ async function main(argv: string[]): Promise<number> {
       durations: { totalMs: performance.now() - totalStart },
       createdAt: new Date().toISOString(),
     };
-    await writeResult(paths, skipped);
+    await writeResult(paths, skipped, explicitOutputDir);
     console.log(`[verify] skipped — result at ${paths.resultJson}`);
     return 0;
   }
@@ -256,7 +256,14 @@ async function main(argv: string[]): Promise<number> {
       const sandboxDir = resolveSandboxDir(target.template as 'react-vite/default-ts');
 
       if (flags.resync) {
-        return runResync({ recipeSpec, baseURL, port, sandboxDir, totalStart });
+        return runResync({
+          recipeSpec,
+          baseURL,
+          port,
+          sandboxDir,
+          totalStart,
+          explicitOutputDir,
+        });
       }
 
       await snapshotSandbox(sandboxDir);
@@ -280,18 +287,23 @@ async function main(argv: string[]): Promise<number> {
     controller.abort();
     const message = err instanceof Error ? (err.stack ?? err.message) : String(err);
     const details = stripAnsi(message).slice(-4000);
-    await writeRegressionResult(paths, 'boot failure (see regressionDetails)', {
-      template: templateLabel(target),
-      details,
-      recipeSpecPath: recipeSpec,
-      durations: {
-        compileMs,
-        symlinkMs,
-        bootMs: undefined,
-        recipeMs: undefined,
-        totalMs: performance.now() - totalStart,
+    await writeRegressionResult(
+      paths,
+      'boot failure (see regressionDetails)',
+      {
+        template: templateLabel(target),
+        details,
+        recipeSpecPath: recipeSpec,
+        durations: {
+          compileMs,
+          symlinkMs,
+          bootMs: undefined,
+          recipeMs: undefined,
+          totalMs: performance.now() - totalStart,
+        },
       },
-    });
+      explicitOutputDir
+    );
     console.error(`[verify] boot failed — wrote regression stub to ${paths.resultJson}`);
     console.error(details);
     return 1;
@@ -332,7 +344,7 @@ async function main(argv: string[]): Promise<number> {
     createdAt: new Date().toISOString(),
   };
 
-  await writeResult(paths, result);
+  await writeResult(paths, result, explicitOutputDir);
   console.log(`[verify] verdict: ${verdict} — result at ${paths.resultJson}`);
   if (traceZipPaths.length > 0) {
     console.log(`[verify] traces: ${traceZipPaths.join(', ')}`);

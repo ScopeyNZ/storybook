@@ -2,8 +2,10 @@
 // Imported by:
 //   - scripts/verify/recipe-author-core.ts (Lane A) — drives the 2-attempt
 //     retry loop and constructs the retry-message body.
-//   - scripts/verify/lint-invocation.ts (Lane C) — re-exports `maxAttempts`
-//     as `LINT_RETRY_POLICY` for the skill caller.
+//
+// `maxAttempts` is also referenced by the verify-recipe-author skill
+// documentation as the canonical retry-budget source — see
+// `.agents/skills/verify-recipe-author/SKILL.md`.
 
 export const RECIPE_RETRY_POLICY = {
   maxAttempts: 2,
@@ -20,11 +22,11 @@ export const RULE_TO_CATEGORY: Record<string, RecipeErrorCategory> = {
   'no-unused-vars': 'imports',
   'import/no-unresolved': 'imports',
   'import/no-extraneous-dependencies': 'imports',
-  // Synthetic rule ids injected by recipe-author-core for the two
-  // post-write regex gates. Keep these in sync with the strings used
-  // when building EslintViolationInput entries.
-  'verify/listener-before-goto': 'listener-before-goto',
-  'verify/attach-pattern': 'attach-pattern',
+  // ESLint custom rules under `.verify-recipes/eslint-plugin/`. These
+  // replaced the prior ad-hoc regex probes; violations now flow through the
+  // normal lint pipeline.
+  'verify-recipes/listener-before-goto': 'listener-before-goto',
+  'verify-recipes/attach-pattern': 'attach-pattern',
 };
 
 const CATEGORY_PRIORITY: Record<RecipeErrorCategory, number> = {

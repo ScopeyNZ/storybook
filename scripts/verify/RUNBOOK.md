@@ -4,6 +4,31 @@ Field-debugging guide for the v6 local-first verify harness. Maps
 common failure signals to root-cause diagnoses and remediation steps,
 for both the local AI fix-loop and the CI workflow.
 
+## Retry strategy
+
+The recipe-author flow has exactly **one** retry boundary:
+
+- **Max attempts: 2** — defined by `MAX_RECIPE_ATTEMPTS` in
+  `scripts/verify/recipe-author-core.ts` (inlined alongside `ERROR_RULES`).
+- **Inner-only.** The TypeScript engine (`runRecipeAuthor`) drives both
+  attempts in-process for the sdk-dispatch path. There is **no** outer
+  workflow-level retry step; the GitHub Actions YAML does not loop.
+- **Stdin-dispatch (skill) path** is the same budget: attempt 1 happens
+  inside the skill (one Agent call), the CLI returns exit 75 with a framed
+  retry message, and attempt 2 is the skill's second Agent call piped back
+  through the CLI with `--retry-of <runId>`. After attempt 2 the CLI emits
+  a terminal failure status and exit 1 — never exit 75 again.
+- **Deny-regex hits are NOT retried.** They terminate immediately with
+  `status: 'deny-regex-hit'`. Retrying a security-blocked spec is unsafe.
+- **Extract failures (missing fence markers) consume an attempt** and
+  return `status: 'extract-failed'` on exhaustion.
+
+The retry message is built from the categorized ESLint output
+(`categorizeEslintViolations`) and includes the new
+`verify-recipes/listener-before-goto` and `verify-recipes/attach-pattern`
+rules introduced when the ad-hoc regex checks were lifted into the ESLint
+plugin under `.verify-recipes/eslint-plugin/`.
+
 ## Local AI fix-loop
 
 The expected loop:

@@ -8,17 +8,24 @@
 // the LLM call under human review and pipes the reply here. On lint/regex
 // failure with attempt 1, the script frames a retry message to stdout and
 // exits 75 so the skill can run the second dispatch.
+//
+// @internal The `--dispatch-mode stdin` and `--retry-of` flags are used only
+// by the local-dev verify-recipe-author skill bridge. CI does NOT use this
+// path — the workflow always invokes `--dispatch-mode sdk` (the default).
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { parseArgs } from 'node:util';
 
 import { dispatchRecipeAuthor, resolveModelId } from './verify/agent-dispatch.ts';
+import { assertAnthropicBaseUrl } from './verify/anthropic-env.ts';
 import {
   runRecipeAuthor,
   type PromptBundle,
   type DispatchFn,
 } from './verify/recipe-author-core.ts';
+
+assertAnthropicBaseUrl();
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const VERIFY_OUTPUT_DIR = path.resolve(repoRoot, '.verify-output');
@@ -144,6 +151,16 @@ async function main(rawArgv: string[]): Promise<number> {
     return 1;
   }
 
+  // M3: refuse implicit findLatestBundle() in CI — picking up an unrelated
+  // run's bundle by accident would publish the wrong spec. CI must always
+  // pass --bundle explicitly so the path is traceable in the workflow log.
+  if (process.env.CI === 'true' && !flags.bundle) {
+    console.error(
+      '[verify-pr-author] --bundle <path> is required in CI. Refusing to fall back to findLatestBundle().'
+    );
+    return 1;
+  }
+
   const bundlePath = flags.bundle ?? findLatestBundle();
   if (!bundlePath) {
     console.error(`[verify-pr-author] no prompt bundle found under ${VERIFY_OUTPUT_DIR}.`);
@@ -170,6 +187,9 @@ async function main(rawArgv: string[]): Promise<number> {
       return r.assistantText;
     };
   } else {
+    // @internal stdin path — used only by the local-dev verify-recipe-author
+    // skill bridge (see .agents/skills/verify-recipe-author/SKILL.md). CI
+    // does NOT exercise this branch; the workflow always runs sdk mode.
     let stdinReadOnce = false;
     dispatch = async () => {
       if (stdinReadOnce) {

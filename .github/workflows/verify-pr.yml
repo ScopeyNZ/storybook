@@ -2,7 +2,7 @@ name: PR Verification Harness
 on:
   pull_request_target:
     types: [labeled, synchronize]
-    paths-ignore: ['docs/**', '**/*.md', '.github/**']
+    paths-ignore: ['docs/**', '**/*.md']
 
 # v6 single-round model: recipe is authored AND executed in the same workflow
 # run. The authored spec is materialised straight into the untrusted PR-head
@@ -30,13 +30,18 @@ jobs:
       - name: Checkout base
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          # `pull_request.base.sha` is captured at PR creation / sync and lags
-          # behind the actual base-branch tip when the base advances independently
-          # of the PR head. The harness depends on always-latest trusted scripts
-          # (verify-pr-generate flags, deny-regex, lint config) so we pin to the
-          # branch ref instead — pull_request_target keeps execution on trusted
-          # workflow + script content either way.
+          # see RUNBOOK.md §base-checkout-ref-pinning
           ref: ${{ github.event.pull_request.base.ref }}
+          # Do not persist the actions/checkout token into .git/config — keeps
+          # GITHUB_TOKEN out of any subprocess that subsequently runs `git`
+          # inside the workspace (untrusted yarn install / nx compile scripts).
+          persist-credentials: false
+      - name: Scrub any residual checkout credentials
+        # Belt-and-suspenders for persist-credentials:false — if the base
+        # checkout ever wrote an Authorization header into .git/config under
+        # an old runner image, drop it now before any untrusted code runs.
+        run: |
+          git config --unset-all http.https://github.com/.extraheader || true
       - name: Setup Node.js and Install Dependencies
         uses: ./.github/actions/setup-node-and-install
         with:
@@ -67,6 +72,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -75,28 +81,49 @@ jobs:
             "https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git" \
             "$PR_HEAD_DIR"
           cd "$PR_HEAD_DIR"
+          # Fetch both the PR-head SHA and the base SHA so we can compute a
+          # stable diff pinned to the event payload (UX2). Without the base
+          # SHA available locally, `git diff $BASE_SHA $PR_HEAD_SHA` would
+          # fall back to network resolution.
           git -c protocol.version=2 fetch --no-tags --depth=1 origin "$PR_HEAD_SHA"
+          git -c protocol.version=2 fetch --no-tags --depth=1 origin "$BASE_SHA"
           git checkout --force "$PR_HEAD_SHA"
           git remote set-url origin "https://github.com/${REPO}.git"
           git config --local --unset-all credential.helper 2>/dev/null || true
 
       - name: Fetch PR diff
-        run: gh pr diff ${{ github.event.pull_request.number }} > /tmp/pr.diff
+        # UX2: compute diff against the event-payload SHAs rather than the
+        # latest `gh pr diff <number>` (which races the PR mid-update).
+        # M1: write to $RUNNER_TEMP, not /tmp — /tmp is in srt allowWrite so
+        # an untrusted recipe could corrupt the diff between steps.
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          git -C "$PR_HEAD_DIR" diff "$BASE_SHA" "$PR_HEAD_SHA" > "$RUNNER_TEMP/pr.diff"
 
       - name: Generate bundle
         # Trusted scripts (base checkout) read trusted authoring-guide +
         # canonical smoke + triage rules from the base. The bundle's
         # outputSpecPath is set to the ephemeral PR-head path so the Author
         # step writes the recipe straight into the untrusted workspace.
-        run: |
-          yarn verify-pr-generate \
-            --pr ${{ github.event.pull_request.number }} \
-            --force \
-            --output "$PR_HEAD_DIR/.verify-recipes/pr-${{ github.event.pull_request.number }}.spec.ts"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # UX2: pin the diff to the event-payload SHAs via the new flags
+          # w4 added to verify-pr-generate. Eliminates the race window where
+          # `gh pr diff <num>` would return a newer PR head than the workflow
+          # is actually evaluating.
+          yarn verify-pr-generate \
+            --pr "$PR_NUMBER" \
+            --force \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$PR_HEAD_SHA" \
+            --output "$PR_HEAD_DIR/.verify-recipes/pr-${PR_NUMBER}.spec.ts"
 
       - name: Author recipe
         # ANTHROPIC_API_KEY is scoped to THIS step only. The Verify step that
@@ -120,67 +147,73 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$PR_HEAD_DIR/.verify-recipes"
-          cp .verify-recipes/_util.ts "$PR_HEAD_DIR/.verify-recipes/_util.ts"
-          cp .verify-recipes/example-smoke.spec.ts "$PR_HEAD_DIR/.verify-recipes/example-smoke.spec.ts"
+          # Refuse symlinks at the destination — a malicious PR-head could
+          # plant a symlink there pointing at $HOME/.ssh, which our `cp`
+          # would happily follow without --no-dereference.
+          for f in _util.ts example-smoke.spec.ts; do
+            dest="$PR_HEAD_DIR/.verify-recipes/$f"
+            if [ -L "$dest" ]; then
+              echo "[sync] refusing to overwrite symlink at $dest" >&2
+              exit 1
+            fi
+            cp --no-dereference --remove-destination ".verify-recipes/$f" "$dest"
+          done
 
       - name: Install sandbox-runtime (Layer-2)
-        # Layer-2 defense-in-depth: wrap `yarn verify-pr` (the only step that
-        # executes the agent-emitted Playwright spec from untrusted PR-head
-        # code) in @anthropic-ai/sandbox-runtime. bubblewrap-backed FS +
-        # network jail so a compromised recipe can't reach ~/.ssh, ~/.aws,
-        # ~/.npmrc, or the public internet. Layer-1 already strips creds
-        # from env; Layer-2 catches anything that survives env-stripping
-        # plus tightens the FS attack surface.
-        #
-        # ubuntu-22.04 has unprivileged user namespaces enabled by default,
-        # which bubblewrap requires. ubuntu-24.04+ would need
-        # `sysctl kernel.apparmor_restrict_unprivileged_userns=0`.
+        # see RUNBOOK.md §sandbox-runtime-layer-2
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends bubblewrap socat ripgrep
-          sudo npm install -g @anthropic-ai/sandbox-runtime
+          # Pin to an exact version so a malicious upstream release cannot
+          # quietly land in CI. `--ignore-scripts` prevents the upstream
+          # tarball from running postinstall hooks under sudo. Bump
+          # procedure: see scripts/verify/SECURITY.md §pinning-sandbox-runtime.
+          sudo npm install -g --ignore-scripts @anthropic-ai/sandbox-runtime@0.0.51
           srt --version
+          # Post-install integrity check. EXPECTED_SRT_SHA is the sha256 of
+          # the resolved `srt` shim at the pinned version above. Bump
+          # procedure: see scripts/verify/SECURITY.md §pinning-sandbox-runtime.
+          # FAIL-CLOSED: owner MUST populate EXPECTED_SRT_SHA below before
+          # merging. A literal "TBD-OWNER-FILL" placeholder aborts the run.
+          EXPECTED_SRT_SHA="TBD-OWNER-FILL"
+          if [ "$EXPECTED_SRT_SHA" = "TBD-OWNER-FILL" ]; then
+            echo "[srt] EXPECTED_SRT_SHA is unpinned (TBD-OWNER-FILL) — owner must populate before merge" >&2
+            exit 1
+          fi
+          actual=$(sha256sum "$(which srt)" | cut -d' ' -f1)
+          if [ "$actual" != "$EXPECTED_SRT_SHA" ]; then
+            echo "srt sha mismatch — expected=$EXPECTED_SRT_SHA actual=$actual" >&2
+            exit 1
+          fi
+          echo "[srt] sha verified: $actual"
 
       - name: Build sandbox settings
-        # Linux srt requires literal paths (no glob, no env var expansion).
-        # Compose the settings file at runtime so $RUNNER_TEMP / $HOME
-        # resolve to the runner's actual paths. denyRead the high-value
-        # credential targets even though default reads are allow (extra
-        # belt-and-suspenders alongside Layer-1's env stripping). allowWrite
-        # covers RUNNER_TEMP (contains PR_HEAD_DIR + .verify-output),
-        # $SANDBOX_TMPDIR (TMPDIR override, see below), and HOME/.cache
-        # (playwright binary cache writes during browser launch).
-        #
-        # CLAUDE_CODE_TMPDIR: srt sets TMPDIR=/tmp/claude inside the
-        # sandbox by default (see anthropic-experimental/sandbox-runtime
-        # src/sandbox/sandbox-utils.ts L320-325). It then `--bind`s host
-        # paths into the sandbox at the same paths — but bwrap doesn't
-        # auto-create them, so if /tmp/claude doesn't exist on the host,
-        # yarn's mktempPromise crashes with ENOENT. Override with a path
-        # under RUNNER_TEMP we pre-create and that's already in allowWrite.
+        # see RUNBOOK.md §srt-sandbox-settings
         run: |
           set -euo pipefail
           SANDBOX_TMPDIR="$RUNNER_TEMP/sandbox-tmp"
           mkdir -p "$SANDBOX_TMPDIR"
-          # bwrap --bind requires the host source to exist. Pre-create
-          # $HOME/.storybook so Storybook's global settings writes
-          # (~/.storybook/settings.json) don't EROFS inside the sandbox.
-          # Note this is the GLOBAL user-prefs file; workspace .storybook
-          # at $PR_HEAD_DIR/code/.storybook is already covered by the
-          # $RUNNER_TEMP allowWrite entry.
+          # Narrow scratch path replaces $RUNNER_TEMP from allowWrite — the
+          # PR-head workspace + ephemeral .verify-output now share a single
+          # writable subtree under $PR_HEAD_DIR. Result-file path is
+          # exported via $GITHUB_OUTPUT (see Verify PR step) so downstream
+          # steps don't `ls -t` arbitrary subdirs.
+          mkdir -p "$PR_HEAD_DIR/.verify-scratch"
+          mkdir -p "$PR_HEAD_DIR/.verify-out-trusted"
           mkdir -p "$HOME/.storybook"
           cat > "$RUNNER_TEMP/srt-settings.json" <<JSON
           {
             "network": {
               "allowLocalBinding": true,
-              "allowedDomains": [],
-              "deniedDomains": []
+              "allowedDomains": ["localhost", "127.0.0.1"],
+              "deniedDomains": ["*"]
             },
             "filesystem": {
               "allowRead": [],
               "allowWrite": [
-                "$RUNNER_TEMP",
+                "$PR_HEAD_DIR",
+                "$SANDBOX_TMPDIR",
                 "/tmp",
                 "$HOME/.cache",
                 "$HOME/.local/share",
@@ -192,9 +225,13 @@ jobs:
                 "$HOME/.docker",
                 "$HOME/.npmrc",
                 "$HOME/.gitconfig",
-                "$HOME/.config/gh"
+                "$HOME/.config/gh",
+                "$GITHUB_WORKSPACE/.git"
               ],
-              "denyWrite": []
+              "denyWrite": [
+                "$GITHUB_WORKSPACE",
+                "$GITHUB_WORKSPACE/.git"
+              ]
             }
           }
           JSON
@@ -202,69 +239,115 @@ jobs:
           echo "CLAUDE_CODE_TMPDIR=$SANDBOX_TMPDIR" >> "$GITHUB_ENV"
           cat "$RUNNER_TEMP/srt-settings.json"
 
+      - name: Smoke-test srt egress policy
+        # Fail-closed sanity check: if the jail config drifts and lets
+        # arbitrary domains through, this step trips immediately rather
+        # than waiting for a malicious recipe to exfil during Verify PR.
+        # We expect the curl to fail (non-zero exit) because example.com
+        # is not in allowedDomains; if it succeeds, the policy is broken.
+        run: |
+          set -uo pipefail
+          if srt --settings "$SRT_SETTINGS" curl --max-time 5 https://example.com >/dev/null 2>&1; then
+            echo "[smoke] EGRESS POLICY BROKEN — example.com reachable inside srt" >&2
+            exit 1
+          fi
+          echo "[smoke] egress correctly denied"
+
       - name: Verify PR
+        id: verify
         working-directory: ${{ runner.temp }}/pr-head
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
-          # Force Nx to run locally — the fork harness firetest runs without
-          # Nx Cloud org auth, and the Verify step does not need distributed
-          # cache. Upstream CI behaviour is unaffected (other steps that
-          # already use Nx Cloud auth continue to do so).
+          # see RUNBOOK.md §nx-no-cloud-rationale
           NX_NO_CLOUD: 'true'
           NX_CLOUD_ACCESS_TOKEN: ''
         run: |
           set -euo pipefail
-          # Layer-1 security: drop secrets from the env before invoking any
-          # PR-head script. `pull_request_target` runs build / sandbox /
-          # recipe code from the untrusted PR head as the same runner user
-          # that holds GITHUB_TOKEN (contents:write, pull-requests:write,
-          # screenshots-branch push) and the (already step-scoped)
-          # ANTHROPIC_API_KEY. A compromised build script or agent-emitted
-          # recipe could otherwise exfil them. This step doesn't need any
-          # of these secrets — compile + verify-pr only touch localhost +
-          # the PR-head workspace.
-          unset GITHUB_TOKEN GH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-          yarn install --immutable
-          # Install the Playwright chromium browser binary on the runner
-          # (the GitHub-hosted ubuntu-22.04 image does not pre-bundle
-          # @playwright/test browsers).
-          yarn playwright install --with-deps chromium
+          # see RUNBOOK.md §verify-pr-secret-stripping
+          # C3: extend unset to cover the telemetry webhook + every actions
+          # token shape the runner may inject, in addition to the existing
+          # GITHUB / ANTHROPIC keys.
+          unset GITHUB_TOKEN GH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN \
+                ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+                ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RESULTS_URL ACTIONS_CACHE_URL \
+                TELEMETRY_AGENTIC_VERIFICATION_WEBHOOK_URL \
+                TELEMETRY_AGENTIC_VERIFICATION_WEBHOOK_TOKEN
+          # UX1: redirect $GITHUB_ENV / $GITHUB_PATH / $GITHUB_OUTPUT to
+          # throwaway files inside $RUNNER_TEMP so an untrusted install /
+          # compile script can't poison subsequent steps by writing
+          # `FOO=evil` into the runner's real $GITHUB_ENV.
+          SINK_DIR="$RUNNER_TEMP/sink"
+          mkdir -p "$SINK_DIR"
+          SINK_GITHUB_ENV="$SINK_DIR/github_env"
+          SINK_GITHUB_PATH="$SINK_DIR/github_path"
+          SINK_GITHUB_OUTPUT="$SINK_DIR/github_output"
+          : > "$SINK_GITHUB_ENV"
+          : > "$SINK_GITHUB_PATH"
+          : > "$SINK_GITHUB_OUTPUT"
+          # Disable postinstall lifecycle scripts in the PR-head workspace —
+          # malicious package.json `postinstall` hooks would otherwise run
+          # under yarn install before srt wraps anything. The override is a
+          # local .yarnrc.yml fragment merged with the head's own config;
+          # `enableScripts: false` is the documented Yarn Berry knob.
+          cat > "$PR_HEAD_DIR/.yarnrc.override.yml" <<'YRC'
+          enableScripts: false
+          YRC
+          # Loosened FS allowlist for install/compile: yarn pulls from the
+          # global cache (~/.cache/yarn) and playwright writes its binary
+          # under ~/.cache/ms-playwright. Both are already covered by the
+          # $HOME/.cache entry in allowWrite; we explicitly mention them
+          # in this comment so future hardening passes don't try to remove
+          # the parent without restoring per-tool subpaths.
+          # srt-wrapped install: env -i strips every non-allowlisted var so
+          # ACTIONS_* tokens cannot leak even if `unset` is bypassed by
+          # subshell quoting. Keep the explicit allowlist narrow.
+          env -i \
+            HOME="$HOME" \
+            PATH="$PATH" \
+            RUNNER_TEMP="$RUNNER_TEMP" \
+            NX_NO_CLOUD=true \
+            PR_HEAD_DIR="$PR_HEAD_DIR" \
+            GITHUB_ENV="$SINK_GITHUB_ENV" \
+            GITHUB_PATH="$SINK_GITHUB_PATH" \
+            GITHUB_OUTPUT="$SINK_GITHUB_OUTPUT" \
+            YARN_RC_FILENAME="$PR_HEAD_DIR/.yarnrc.override.yml" \
+            srt --settings "$SRT_SETTINGS" \
+            yarn install --immutable
+          # Playwright browser binaries. Same srt wrap + env scrubbing.
+          env -i \
+            HOME="$HOME" \
+            PATH="$PATH" \
+            RUNNER_TEMP="$RUNNER_TEMP" \
+            NX_NO_CLOUD=true \
+            PR_HEAD_DIR="$PR_HEAD_DIR" \
+            GITHUB_ENV="$SINK_GITHUB_ENV" \
+            GITHUB_PATH="$SINK_GITHUB_PATH" \
+            GITHUB_OUTPUT="$SINK_GITHUB_OUTPUT" \
+            srt --settings "$SRT_SETTINGS" \
+            yarn playwright install --with-deps chromium
+
+          # Trusted output path used both by the compile-failure stub and the
+          # main verify-pr invocation. Threaded to downstream steps via
+          # $GITHUB_OUTPUT so they can consume ${{ steps.verify.outputs.result-path }}
+          # instead of globbing the PR-writable .verify-output tree.
+          VERIFY_RESULT_PATH="$PR_HEAD_DIR/.verify-out-trusted/verify-result.json"
+          export VERIFY_RESULT_PATH
+          STUB_OUT_DIR="$(dirname "$VERIFY_RESULT_PATH")"
+          mkdir -p "$STUB_OUT_DIR"
+          echo "result-path=$VERIFY_RESULT_PATH" >> "$GITHUB_OUTPUT"
 
           # Stub a regression verdict if compile fails. Without this, the
           # workflow short-circuits before verify-result.json is written and
           # the PR comment shows "No verdict produced" — confusing for cases
           # like PR #15 where the upstream PR genuinely doesn't compile.
-          # The stub captures the tail of the compile output as
-          # regressionReason so reviewers see WHY the verdict is regression.
+          # Implementation lives in scripts/verify/ci/write-compile-failure-stub.ts
+          # so the schema stays single-sourced via writeRegressionResult.
           write_compile_failure_stub() {
             local log="$1"
-            local run_id
-            run_id="$(date -u +%Y-%m-%dT%H-%M-%S.000Z)"
-            local out_dir=".verify-output/${run_id}"
-            mkdir -p "$out_dir"
-            local reason
-            # Strip ANSI escape sequences (CSI / SGR) so the PR comment shows
-            # readable text rather than `^[[31m`-style noise.
-            reason="$(tail -c 4000 "$log" | tr -d '\000' | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' | jq -Rs .)"
-            jq -n \
-              --arg runId "$run_id" \
-              --arg template "internal-ui" \
-              --argjson reason "$reason" \
-              '{
-                schemaVersion: 1,
-                runId: $runId,
-                verdict: "regression",
-                template: $template,
-                regressionReason: "compile failure (see regressionDetails)",
-                regressionDetails: $reason,
-                storyIds: [],
-                recipeSpecPath: "",
-                tests: [],
-                traceZipPaths: [],
-                durations: {},
-                createdAt: (now | todate)
-              }' > "$out_dir/verify-result.json"
-            echo "[verify] compile failure — wrote stub verdict to $out_dir/verify-result.json"
+            node "$GITHUB_WORKSPACE/scripts/verify/ci/write-compile-failure-stub.ts" \
+              --log "$log" \
+              --out-dir "$STUB_OUT_DIR" \
+              --template "internal-ui"
           }
           COMPILE_LOG="$RUNNER_TEMP/verify-compile.log"
           # Pick the prep path based on the recipe's @verify-target header.
@@ -301,44 +384,51 @@ jobs:
             esac
           fi
 
+          # srt-wrapped compile. Each invocation runs through env -i so
+          # ACTIONS_* tokens stay out of sub-build scripts (postinstall hooks,
+          # NX plugin loaders) regardless of `unset` earlier in the step.
+          # UX1: $GITHUB_ENV / $GITHUB_PATH / $GITHUB_OUTPUT redirect to
+          # throwaway sinks so an untrusted compile step can't write into
+          # the runner's real action files.
+          srt_compile() {
+            env -i \
+              HOME="$HOME" \
+              PATH="$PATH" \
+              RUNNER_TEMP="$RUNNER_TEMP" \
+              NX_NO_CLOUD=true \
+              PR_HEAD_DIR="$PR_HEAD_DIR" \
+              GITHUB_ENV="$SINK_GITHUB_ENV" \
+              GITHUB_PATH="$SINK_GITHUB_PATH" \
+              GITHUB_OUTPUT="$SINK_GITHUB_OUTPUT" \
+              srt --settings "$SRT_SETTINGS" \
+              "$@"
+          }
           if [ "$TARGET" = "sandbox" ]; then
             echo "[verify] spec targets sandbox '$TEMPLATE' — running 'nx run $TEMPLATE:sandbox'"
-            # The `:sandbox` target resolves implicitDependencies (core,
-            # cli, addons, the framework package) and generates the
-            # sandbox project under code/sandbox/<key>. No extra
-            # `nx compile core` / `run-many` needed — nx topo-orders deps
-            # itself.
-            if ! yarn nx run "$TEMPLATE:sandbox" 2>&1 | tee "$COMPILE_LOG"; then
+            # see RUNBOOK.md §sandbox-target-compile-rationale
+            if ! srt_compile yarn nx run "$TEMPLATE:sandbox" 2>&1 | tee "$COMPILE_LOG"; then
               write_compile_failure_stub "$COMPILE_LOG"
               exit 0
             fi
           else
-            # internal-ui path. Compile core first (eslint-plugin's
-            # prebuild script imports `storybook/csf` via jiti and needs
-            # `storybook/dist/csf/index.js` to resolve; nx run-many does
-            # not topo-order this unless `dependsOn: ["^compile"]` is set,
-            # which the repo currently lacks for the eslint-plugin chain).
-            if ! yarn nx compile core 2>&1 | tee "$COMPILE_LOG"; then
+            # see RUNBOOK.md §internal-ui-compile-order
+            if ! srt_compile yarn nx compile core 2>&1 | tee "$COMPILE_LOG"; then
               write_compile_failure_stub "$COMPILE_LOG"
               exit 0
             fi
-            # Then compile every other NX project so the internal-ui dev
-            # server can resolve @storybook/react-vite + every addon
-            # listed in code/.storybook/main.ts.
-            if ! yarn nx run-many -t compile 2>&1 | tee "$COMPILE_LOG"; then
+            if ! srt_compile yarn nx run-many -t compile 2>&1 | tee "$COMPILE_LOG"; then
               write_compile_failure_stub "$COMPILE_LOG"
               exit 0
             fi
           fi
 
-          # Swallow non-zero exit so downstream Evidence-check / Retry steps
-          # always run. Final verdict gate at end of job ("Fail job if final
-          # verdict is regression") preserves red-CI signal based on the
-          # post-retry verdict in verify-result.json.
-          # Layer-2: srt wraps just this invocation — install + compile
-          # above legitimately need full FS + network for yarn registries +
-          # node_modules writes, so they run outside the sandbox.
+          # verify-pr (scripts/verify/core.ts + scripts/verify-pr.ts) reads
+          # $VERIFY_RESULT_PATH (exported above) and writes verify-result.json
+          # there directly. Downstream steps consume the same path via
+          # ${{ steps.verify.outputs.result-path }}.
+          # see RUNBOOK.md §verify-pr-exit-swallowing
           srt --settings "$SRT_SETTINGS" \
+            env VERIFY_RESULT_PATH="$VERIFY_RESULT_PATH" \
             yarn verify-pr --recipe-spec ".verify-recipes/pr-${PR_NUMBER}.spec.ts" || \
             echo "verify-pr exited non-zero — verdict captured in verify-result.json"
 
@@ -356,14 +446,13 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          RESULT: ${{ steps.verify.outputs.result-path }}
         run: |
           set -euo pipefail
-          if ! compgen -G "$PR_HEAD_DIR/.verify-output/*/verify-result.json" >/dev/null; then
-            echo "no verify-result.json — skipping evidence check"
+          if [ ! -f "$RESULT" ]; then
+            echo "no verify-result.json at $RESULT — skipping evidence check"
             exit 0
           fi
-          # shellcheck disable=SC2012
-          RESULT=$(ls -t "$PR_HEAD_DIR"/.verify-output/*/verify-result.json | head -1)
           VERDICT=$(jq -r '.verdict' "$RESULT")
           if [ "$VERDICT" != "verified" ]; then
             echo "verdict is '$VERDICT' — skipping evidence check (retry will use Playwright error context)"
@@ -372,7 +461,7 @@ jobs:
           RECIPE="$PR_HEAD_DIR/.verify-recipes/pr-${PR_NUMBER}.spec.ts"
           yarn verify-evidence-check \
             --result "$RESULT" \
-            --diff /tmp/pr.diff \
+            --diff "$RUNNER_TEMP/pr.diff" \
             --recipe "$RECIPE"
 
       - name: Retry on regression or evidence missing/undetermined
@@ -397,16 +486,17 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           NX_NO_CLOUD: 'true'
           NX_CLOUD_ACCESS_TOKEN: ''
+          RESULT: ${{ steps.verify.outputs.result-path }}
         run: |
           set -euo pipefail
-          if ! compgen -G "$PR_HEAD_DIR/.verify-output/*/verify-result.json" >/dev/null; then
-            echo "no verify-result.json — skipping retry"
+          if [ ! -f "$RESULT" ]; then
+            echo "no verify-result.json at $RESULT — skipping retry"
             exit 0
           fi
-          # shellcheck disable=SC2012
-          RESULT=$(ls -t "$PR_HEAD_DIR"/.verify-output/*/verify-result.json | head -1)
           VERDICT=$(jq -r '.verdict' "$RESULT")
           EVIDENCE=$(jq -r '.evidenceVerdict // "n/a"' "$RESULT")
           RUN_DIR=$(dirname "$RESULT")
@@ -461,9 +551,14 @@ jobs:
               ;;
           esac
 
+          # shellcheck disable=SC2012
+          PRIOR_RUN_DIR=$(ls -dt "$PR_HEAD_DIR"/.verify-output/*/ 2>/dev/null | head -1 || true)
           if ! yarn verify-pr-generate \
               --pr "$PR_NUMBER" \
               --force \
+              --base-sha "$BASE_SHA" \
+              --head-sha "$PR_HEAD_SHA" \
+              --prior-run-dir "${PRIOR_RUN_DIR%/}" \
               --output "$PR_HEAD_DIR/.verify-recipes/pr-${PR_NUMBER}.spec.ts" \
               --retry-context "$REASON"; then
             echo "retry verify-pr-generate failed — keeping original verdict"
@@ -477,39 +572,50 @@ jobs:
             exit 0
           fi
 
+          # Capture mtime of the trusted result so we can detect whether the
+          # retry actually produced a new write. The retry overwrites
+          # $RESULT in place (verify-pr respects VERIFY_RESULT_PATH).
+          PREV_MTIME=$(stat -c '%Y' "$RESULT" 2>/dev/null || stat -f '%m' "$RESULT" 2>/dev/null || echo 0)
+
           # Sub-shell so set -e here doesn't kill the outer step on regression.
-          # Strip secrets from env: this invocation runs the agent-emitted
-          # spec (untrusted), so GITHUB_TOKEN / GH_TOKEN / ANTHROPIC_API_KEY
-          # must not be visible to the subprocess. The trusted scripts
-          # above (verify-pr-generate, verify-pr-author) still see them
-          # because env -u only strips for this single command. srt wraps
-          # the actual recipe execution for Layer-2 FS + network jail.
-          ( cd "$PR_HEAD_DIR" && env -u GITHUB_TOKEN -u GH_TOKEN -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
+          # C8: env -i (allowlist) instead of env -u (denylist) so the
+          # agent-emitted spec only sees the variables we explicitly thread
+          # in. Mirrors the first-run Verify PR step's path so a leak there
+          # can't reappear on retry.
+          (
+            cd "$PR_HEAD_DIR"
+            env -i \
+              HOME="$HOME" \
+              PATH="$PATH" \
+              RUNNER_TEMP="$RUNNER_TEMP" \
+              NX_NO_CLOUD=true \
+              PR_HEAD_DIR="$PR_HEAD_DIR" \
+              VERIFY_RESULT_PATH="$RESULT" \
               srt --settings "$SRT_SETTINGS" \
-              yarn verify-pr --recipe-spec ".verify-recipes/pr-${PR_NUMBER}.spec.ts" ) || \
+              yarn verify-pr --recipe-spec ".verify-recipes/pr-${PR_NUMBER}.spec.ts"
+          ) || \
             echo "retry verify-pr exited non-zero — evidence-check will still run if verdict==verified"
 
-          # shellcheck disable=SC2012
-          NEW_RESULT=$(ls -t "$PR_HEAD_DIR"/.verify-output/*/verify-result.json | head -1)
-          if [ "$NEW_RESULT" = "$RESULT" ]; then
+          NEW_MTIME=$(stat -c '%Y' "$RESULT" 2>/dev/null || stat -f '%m' "$RESULT" 2>/dev/null || echo 0)
+          if [ "$NEW_MTIME" = "$PREV_MTIME" ]; then
             echo "retry produced no new verify-result.json — keeping original verdict"
             exit 0
           fi
-          # Annotate the new result so downstream observers know this came
-          # from the retry loop.
-          jq '. + {evidenceRetry: true}' "$NEW_RESULT" > "$NEW_RESULT.tmp" && mv "$NEW_RESULT.tmp" "$NEW_RESULT"
+          # Annotate the (overwritten) trusted result so downstream observers
+          # know this came from the retry loop.
+          jq '. + {evidenceRetry: true}' "$RESULT" > "$RESULT.tmp" && mv "$RESULT.tmp" "$RESULT"
 
           # Evidence-check only meaningful on a verified verdict; on
           # regression the screenshots typically don't capture the change.
-          NEW_VERDICT=$(jq -r '.verdict' "$NEW_RESULT")
+          NEW_VERDICT=$(jq -r '.verdict' "$RESULT")
           if [ "$NEW_VERDICT" = "verified" ]; then
             yarn verify-evidence-check \
-              --result "$NEW_RESULT" \
-              --diff /tmp/pr.diff \
+              --result "$RESULT" \
+              --diff "$RUNNER_TEMP/pr.diff" \
               --recipe "$PR_HEAD_DIR/.verify-recipes/pr-${PR_NUMBER}.spec.ts" || true
           fi
 
-          FINAL_EVIDENCE=$(jq -r '.evidenceVerdict // "n/a"' "$NEW_RESULT")
+          FINAL_EVIDENCE=$(jq -r '.evidenceVerdict // "n/a"' "$RESULT")
           echo "retry complete — final verdict=$NEW_VERDICT evidence=$FINAL_EVIDENCE"
 
       - name: Run PR-added unit tests
@@ -529,30 +635,39 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           NX_NO_CLOUD: 'true'
           NX_CLOUD_ACCESS_TOKEN: ''
+          RESULT: ${{ steps.verify.outputs.result-path }}
         run: |
           set -euo pipefail
           # Layer-1 security: PR-added test files are agent / contributor
           # content, untrusted under pull_request_target. Strip secrets so
           # a malicious test file can't read GITHUB_TOKEN /
           # ANTHROPIC_API_KEY from env. This step doesn't need either.
-          unset GITHUB_TOKEN GH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
-          if ! compgen -G "$PR_HEAD_DIR/.verify-output/*/verify-result.json" >/dev/null; then
-            echo "no verify-result.json — skipping unit-test step"
+          # C3: extended unset to cover every actions / telemetry token
+          # shape; the actual vitest run is also wrapped in env -i below
+          # so this is belt-and-suspenders.
+          unset GITHUB_TOKEN GH_TOKEN ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN \
+                ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN \
+                ACTIONS_ID_TOKEN_REQUEST_URL ACTIONS_RESULTS_URL ACTIONS_CACHE_URL \
+                TELEMETRY_AGENTIC_VERIFICATION_WEBHOOK_URL \
+                TELEMETRY_AGENTIC_VERIFICATION_WEBHOOK_TOKEN
+          if [ ! -f "$RESULT" ]; then
+            echo "no verify-result.json at $RESULT — skipping unit-test step"
             exit 0
           fi
-          RESULT=$(ls -t "$PR_HEAD_DIR"/.verify-output/*/verify-result.json | head -1)
 
           # Extract added/modified test files from the captured PR diff.
           # Pattern matches `*.test.*` and `*.spec.*` under code/ — wide
           # enough to catch component / utility tests; the workflow has
           # already declined to run if the PR comment label gate was off.
+          # M1: pull from $RUNNER_TEMP/pr.diff (not /tmp, which is in srt
+          # allowWrite and reachable from untrusted recipes).
           TEST_FILES=()
           while IFS= read -r f; do
             [ -z "$f" ] && continue
             [ -f "$f" ] || continue
             TEST_FILES+=("$f")
           done < <(
-            grep -E '^\+\+\+ b/code/.+\.(test|spec)\.(ts|tsx|js|jsx)$' /tmp/pr.diff 2>/dev/null \
+            grep -E '^\+\+\+ b/code/.+\.(test|spec)\.(ts|tsx|js|jsx)$' "$RUNNER_TEMP/pr.diff" 2>/dev/null \
               | sed 's|^+++ b/||' \
               | sort -u
           )
@@ -566,12 +681,25 @@ jobs:
 
           echo "running ${#TEST_FILES[@]} unit test file(s): ${TEST_FILES[*]}"
           REPORT="$RUNNER_TEMP/unit-tests-report.json"
+          VITEST_LOG="$RUNNER_TEMP/vitest.log"
 
-          # Vitest emits a JSON reporter file when --reporter=json is set.
+          # C3: vitest runs the PR-added test files (untrusted code under
+          # pull_request_target). Wrap in srt + env -i so a malicious test
+          # cannot read ACTIONS_* / token envs and cannot reach the network
+          # outside the allowedDomains list. `--` separates vitest flags
+          # from positional test paths; without it a test file named
+          # `--cleanup` would be parsed as an option.
           # `set -e` is off for this block so vitest exit codes don't kill
           # the step; we surface the verdict via JSON inspection.
           set +e
-          yarn vitest run --reporter=json --outputFile "$REPORT" "${TEST_FILES[@]}" > /tmp/vitest.log 2>&1
+          env -i \
+            HOME="$HOME" \
+            PATH="$PATH" \
+            RUNNER_TEMP="$RUNNER_TEMP" \
+            NX_NO_CLOUD=true \
+            PR_HEAD_DIR="$PR_HEAD_DIR" \
+            srt --settings "$SRT_SETTINGS" \
+            yarn vitest run --reporter=json --outputFile "$REPORT" -- "${TEST_FILES[@]}" > "$VITEST_LOG" 2>&1
           VITEST_EXIT=$?
           set -e
 
@@ -582,10 +710,12 @@ jobs:
             PASSED=false
             SUMMARY="vitest exited $VITEST_EXIT without writing a JSON report (likely setup error); see Action log"
           fi
-          # Capture the tail of vitest stdout so the comment can show
-          # readable failure output (ANSI-stripped).
-          DETAILS=$(tail -c 4000 /tmp/vitest.log | tr -d '\000' \
-            | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g' | jq -Rs .)
+          # UC4: strip all C0/C1 control chars + ANSI CSI/OSC/DCS escapes
+          # via perl so the captured details render cleanly in the PR
+          # comment regardless of terminal-control noise vitest emits.
+          DETAILS=$(tail -c 4000 "$VITEST_LOG" \
+            | perl -pe 's/\x1B[@-Z\\-_]|\x1B\[[0-?]*[ -\/]*[@-~]|\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)|\x1BP[^\x1B]*\x1B\\|[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]//g' \
+            | jq -Rs .)
 
           jq \
             --argjson passed "$PASSED" \
@@ -599,79 +729,40 @@ jobs:
       - name: Read verdict
         id: verdict
         if: always()
+        env:
+          RESULT: ${{ steps.verify.outputs.result-path }}
         run: |
           set -euo pipefail
-          RESULT=""
-          if compgen -G "$PR_HEAD_DIR/.verify-output/*/verify-result.json" >/dev/null; then
-            RESULT=$(ls -t "$PR_HEAD_DIR"/.verify-output/*/verify-result.json | head -1)
-          fi
-          if [ -n "$RESULT" ]; then
-            VERDICT=$(jq -r '.verdict' "$RESULT")
-            UNIT_RAN=$(jq -r '.unitTests.ran // false' "$RESULT")
-            UNIT_PASSED=$(jq -r '.unitTests.passed // null' "$RESULT")
-            REGRESSION_REASON=$(jq -r '.regressionReason // ""' "$RESULT")
-            # Fill in a regressionReason when Playwright failed but verify-pr
-            # didn't populate one (compile-failure stubs already set their
-            # own reason). Extract the failed test name + first error from
-            # playwright-report.json — reviewers see WHY without needing
-            # the trace.zip.
-            if [ "$VERDICT" = "regression" ] && [ -z "$REGRESSION_REASON" ]; then
-              RUN_DIR=$(dirname "$RESULT")
-              REPORT="$RUN_DIR/playwright-report.json"
-              if [ -f "$REPORT" ]; then
-                # `.suites[].specs[].title` is the canonical test name in
-                # Playwright's JSON reporter. Fall back to `.title` on nested
-                # objects when the structure varies.
-                DERIVED=$(jq -r '
-                  [.. | objects | select(has("errors") and (.errors | length > 0))] as $failed
-                  | [.. | objects | select(has("title") and has("ok") and .ok == false) | .title] as $titles_alt
-                  | (($failed | map(.title // empty) + $titles_alt) | unique | map(select(. != "" and . != null)) | .[0:3] | join("; ")) as $titles
-                  | ($failed | .[0].errors[0] | (.message // .stack // tostring)) as $err
-                  | "Playwright assertion failed in: \( if $titles == "" then "?" else $titles end ) — \($err | gsub("\n"; " ") | .[0:400])"
-                ' "$REPORT" 2>/dev/null || true)
-                # Strip ANSI escape sequences — Playwright's expect()
-                # message embeds raw colour codes that render as ^[[2m
-                # / ^[[31m noise in the PR comment.
-                DERIVED=$(printf '%s' "$DERIVED" | sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g')
-                if [ -n "$DERIVED" ] && [ "$DERIVED" != "null" ] && [ "$DERIVED" != "Playwright assertion failed in:  — null" ]; then
-                  jq --arg reason "$DERIVED" '. + {regressionReason: $reason}' \
-                    "$RESULT" > "$RESULT.tmp" && mv "$RESULT.tmp" "$RESULT"
-                  echo "derived regressionReason: $DERIVED"
-                fi
-              fi
-            fi
-            # Compose final verdict from AND of Playwright + unit tests.
-            # If Playwright already says regression we keep it (Playwright
-            # failure is authoritative). If Playwright passed BUT unit tests
-            # ran and failed, downgrade to regression and annotate the
-            # regressionReason so the comment + red-CI signal reflect it.
-            if [ "$VERDICT" = "verified" ] && [ "$UNIT_RAN" = "true" ] && [ "$UNIT_PASSED" = "false" ]; then
-              VERDICT="regression"
-              jq '. + {verdict: "regression", regressionReason: (.regressionReason // "PR-added unit tests failed (see unitTests.details)")}' \
-                "$RESULT" > "$RESULT.tmp" && mv "$RESULT.tmp" "$RESULT"
-              echo "verdict downgraded: Playwright verified but unit tests failed → regression"
-            fi
-            echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
-            echo "verdict: $VERDICT" >> "$GITHUB_STEP_SUMMARY"
-            jq -r '"target=\(.template) regressionReason=\(.regressionReason // "n/a")"' "$RESULT" >> "$GITHUB_STEP_SUMMARY"
-          else
+          # C13: derive-verdict.ts reads $RESULT, derives regressionReason from
+          # playwright-report.json when absent, downgrades verified→regression
+          # if PR-added unit tests failed, and emits `verdict=<value>` to
+          # $GITHUB_OUTPUT. ANSI / control-char stripping lives in the helper.
+          if [ ! -f "$RESULT" ]; then
             echo "verdict=missing" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          REPORT="$(dirname "$RESULT")/playwright-report.json"
+          node "$GITHUB_WORKSPACE/scripts/verify/ci/derive-verdict.ts" \
+            --result "$RESULT" \
+            --report "$REPORT" \
+            >> "$GITHUB_OUTPUT"
 
       - name: Apply verified-by-harness label
         if: steps.verdict.outputs.verdict == 'verified'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
         run: |
           # Ensure the label exists on the repo (idempotent — `gh label create`
           # exits non-zero if the label already exists, which we swallow).
           gh label create verified-by-harness \
-            --repo ${{ github.repository }} \
+            --repo "$REPO" \
             --description "Verified by PR Verify Harness" \
             --color 0E8A16 \
             2>/dev/null || true
-          gh pr edit ${{ github.event.pull_request.number }} \
-            --repo ${{ github.repository }} \
+          gh pr edit "$PR_NUMBER" \
+            --repo "$REPO" \
             --add-label verified-by-harness
 
       - name: Push screenshots to side branch
@@ -682,79 +773,19 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
+        # C14: push-screenshots.ts encapsulates side-branch clone/orphan
+        # init, PNG mime validation, per-file 5 MB cap, 50 MB bundle cap,
+        # commit + push, and `urls<<EOF` heredoc emit. The helper owns git
+        # user config + the x-access-token auth URL.
         run: |
           set -euo pipefail
-          SOURCE="$PR_HEAD_DIR/.verify-output"
-          if ! find "$SOURCE" -name '*.png' -print -quit | grep -q .; then
-            echo "no screenshots produced — skipping side-branch push"
-            echo "urls=[]" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          ASSETS_DIR="$RUNNER_TEMP/verify-assets"
-          AUTH_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${REPO}.git"
-
-          # Try cloning the existing side branch; if it doesn't exist yet,
-          # create an orphan branch with a single empty commit.
-          if git -c protocol.version=2 clone --depth 1 --branch _verify-screenshots \
-              "$AUTH_URL" "$ASSETS_DIR" 2>/dev/null; then
-            echo "cloned existing _verify-screenshots branch"
-          else
-            echo "side branch missing — creating orphan _verify-screenshots"
-            git -c protocol.version=2 clone --depth 1 "$AUTH_URL" "$ASSETS_DIR"
-            (
-              cd "$ASSETS_DIR"
-              git -c user.email=actions@github.com -c user.name="github-actions[bot]" \
-                checkout --orphan _verify-screenshots
-              git rm -rf . >/dev/null
-              echo "Verify harness screenshot store. Auto-managed; do not edit." > README.md
-              git add README.md
-              git -c user.email=actions@github.com -c user.name="github-actions[bot]" \
-                commit -m "chore: init _verify-screenshots branch"
-              git push origin _verify-screenshots
-            )
-          fi
-
-          PR_DIR="$ASSETS_DIR/pr-${PR_NUMBER}/${RUN_ID}"
-          rm -rf "$ASSETS_DIR/pr-${PR_NUMBER}/${RUN_ID}"
-          mkdir -p "$PR_DIR"
-
-          # Copy each runId/<spec-slug>/<file>.png preserving the structure
-          # under the run directory.
-          (
-            cd "$SOURCE"
-            find . -name '*.png' -print0
-          ) | while IFS= read -r -d '' rel; do
-            dest="$PR_DIR/${rel#./}"
-            mkdir -p "$(dirname "$dest")"
-            cp "$SOURCE/$rel" "$dest"
-          done
-
-          cd "$ASSETS_DIR"
-          git add "pr-${PR_NUMBER}/${RUN_ID}"
-          if git diff --cached --quiet; then
-            echo "no new screenshots to commit"
-            echo "urls=[]" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          git -c user.email=actions@github.com -c user.name="github-actions[bot]" \
-            commit -m "verify: PR #${PR_NUMBER} run ${RUN_ID}"
-          git push origin _verify-screenshots
-          COMMIT_SHA=$(git rev-parse HEAD)
-
-          # Emit JSON array of { rel, url } for each PNG, where url is the
-          # raw.githubusercontent.com URL pinned at the commit we just pushed.
-          URLS=$(
-            cd "$ASSETS_DIR/pr-${PR_NUMBER}/${RUN_ID}"
-            find . -name '*.png' \
-              | sed "s|^\./||" \
-              | jq -R --arg base "https://raw.githubusercontent.com/${REPO}/${COMMIT_SHA}/pr-${PR_NUMBER}/${RUN_ID}" \
-                  '{ rel: ., url: ($base + "/" + .) }' \
-              | jq -s .
-          )
-          echo "urls<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$URLS" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          node "$GITHUB_WORKSPACE/scripts/verify/ci/push-screenshots.ts" \
+            --source "$PR_HEAD_DIR/.verify-output" \
+            --pr "$PR_NUMBER" \
+            --run-id "$RUN_ID" \
+            --repo "$REPO" \
+            --assets-dir "$RUNNER_TEMP/verify-assets" \
+            --output "$GITHUB_OUTPUT"
 
       - name: Append telemetry
         # POST one row per run to a Google Apps Script web app that
@@ -771,167 +802,29 @@ jobs:
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           RUN_ID: ${{ github.run_id }}
-          TELEMETRY_URL: ${{ secrets.TELEMETRY_AGENTIC_VERIFICATION_WEBHOOK_URL }}
-          TELEMETRY_TOKEN: ${{ secrets.TELEMETRY_AGENTIC_VERIFICATION_WEBHOOK_TOKEN }}
+          TELEMETRY_AGENTIC_VERIFICATION_WEBHOOK_URL: ${{ secrets.TELEMETRY_AGENTIC_VERIFICATION_WEBHOOK_URL }}
+          TELEMETRY_AGENTIC_VERIFICATION_WEBHOOK_TOKEN: ${{ secrets.TELEMETRY_AGENTIC_VERIFICATION_WEBHOOK_TOKEN }}
+          RESULT: ${{ steps.verify.outputs.result-path }}
         run: |
           set -euo pipefail
-          if [ -z "${TELEMETRY_URL:-}" ] || [ -z "${TELEMETRY_TOKEN:-}" ]; then
-            echo "telemetry webhook not configured — skipping"
-            exit 0
-          fi
-          if ! compgen -G "$PR_HEAD_DIR/.verify-output/*/verify-result.json" >/dev/null; then
-            echo "no verify-result.json — skipping telemetry"
-            exit 0
-          fi
-          # shellcheck disable=SC2012
-          RESULT=$(ls -t "$PR_HEAD_DIR"/.verify-output/*/verify-result.json | head -1)
-
-          # Aggregate token usage across every Claude dispatch in this
-          # run — recipe-author (initial + retry) and evidence-check
-          # (initial + retry-after-verified). Each call persists a
-          # {model, usage, assistantText} JSON to its run dir via
-          # agent-dispatch.ts / verify-evidence-check.ts. We glob all of
-          # them and sum, then apply Anthropic's published per-million
-          # token prices to get a dollar estimate. Costs are best-effort:
-          # the price table is hardcoded so a price change requires a
-          # workflow edit (Anthropic's pricing is stable enough that
-          # this is acceptable for v8 prioritisation telemetry).
-          # Dispatch artifacts land in two places:
-          #   - recipe-author writes dispatch-response.json under
-          #     $GITHUB_WORKSPACE/.verify-output (verify-pr-author runs
-          #     from the trusted base checkout)
-          #   - evidence-check writes evidence-check-response.json under
-          #     $PR_HEAD_DIR/.verify-output (the result lives there)
-          # Scan both.
-          USAGE_FILES=()
-          while IFS= read -r f; do
-            [ -n "$f" ] && USAGE_FILES+=("$f")
-          done < <(
-            find "$PR_HEAD_DIR/.verify-output" "$GITHUB_WORKSPACE/.verify-output" -type f \
-              \( -name 'dispatch-response.json' -o -name 'evidence-check-response.json' \) \
-              2>/dev/null | sort
-          )
-          if [ ${#USAGE_FILES[@]} -eq 0 ]; then
-            USAGE_JSON='{"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":"0.000000","dispatch_count":0}'
-          else
-            USAGE_JSON=$(jq -s '
-              # USD per million tokens, current Anthropic pricing.
-              #   i   = base input
-              #   o   = output
-              #   cr  = cache hits + refreshes (read)
-              #   cw5 = 5-minute cache writes (SDK default)
-              #   cw1 = 1-hour cache writes (extended cache)
-              def prices:
-                {
-                  "claude-opus-4-7":    {"i": 5.00,  "o": 25.00, "cr": 0.50, "cw5": 6.25, "cw1": 10.00},
-                  "claude-opus-4-6":    {"i": 5.00,  "o": 25.00, "cr": 0.50, "cw5": 6.25, "cw1": 10.00},
-                  "claude-opus-4-5":    {"i": 5.00,  "o": 25.00, "cr": 0.50, "cw5": 6.25, "cw1": 10.00},
-                  "claude-opus-4-1":    {"i": 15.00, "o": 75.00, "cr": 1.50, "cw5": 18.75, "cw1": 30.00},
-                  "claude-opus-4":      {"i": 15.00, "o": 75.00, "cr": 1.50, "cw5": 18.75, "cw1": 30.00},
-                  "claude-sonnet-4-6":  {"i": 3.00,  "o": 15.00, "cr": 0.30, "cw5": 3.75, "cw1": 6.00},
-                  "claude-sonnet-4-5":  {"i": 3.00,  "o": 15.00, "cr": 0.30, "cw5": 3.75, "cw1": 6.00},
-                  "claude-sonnet-4":    {"i": 3.00,  "o": 15.00, "cr": 0.30, "cw5": 3.75, "cw1": 6.00},
-                  "claude-haiku-4-5":   {"i": 1.00,  "o": 5.00,  "cr": 0.10, "cw5": 1.25, "cw1": 2.00},
-                  "claude-haiku-3-5":   {"i": 0.80,  "o": 4.00,  "cr": 0.08, "cw5": 1.00, "cw1": 1.60},
-                  "claude-haiku-3":     {"i": 0.25,  "o": 1.25,  "cr": 0.03, "cw5": 0.30, "cw1": 0.50}
-                };
-              # Strip trailing -YYYYMMDD date suffix that Anthropic
-              # ships alongside the rolling alias (e.g. claude-haiku-4-5
-              # -20251001 → claude-haiku-4-5).
-              def model_key($m):
-                ($m // "") | sub("-2025[0-9]+$"; "") | sub("-2026[0-9]+$"; "");
-              # Coerce any SDK field to a non-negative number. Anthropic
-              # has shipped JSON shapes where a field that was previously
-              # numeric becomes null (or even an object); without this
-              # guard the arithmetic below blew up with "number and object
-              # cannot be divided" on jq 1.6 / 1.7 even though jq 1.8
-              # accepted it.
-              def num($x):
-                ($x | if type == "number" then . else 0 end);
-              reduce .[] as $r (
-                {input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, cost_usd: 0, dispatch_count: 0};
-                ($r.usage // {}) as $u
-                | (prices[model_key($r.model)] // {"i":0,"o":0,"cr":0,"cw5":0,"cw1":0}) as $p
-                # SDK exposes a breakdown under .cache_creation when extended
-                # cache is enabled; otherwise the total lands in
-                # .cache_creation_input_tokens and we charge it at the 5m rate
-                # (the SDK default TTL).
-                | (num($u.cache_creation.ephemeral_5m_input_tokens)) as $cw5_5m
-                | (num($u.cache_creation_input_tokens)) as $cw5_legacy
-                | (if $cw5_5m > 0 then $cw5_5m else $cw5_legacy end) as $cw5_tok
-                | (num($u.cache_creation.ephemeral_1h_input_tokens)) as $cw1_tok
-                | (num($u.input_tokens)) as $in_tok
-                | (num($u.output_tokens)) as $out_tok
-                | (num($u.cache_read_input_tokens)) as $cr_tok
-                | ((
-                    $in_tok  * $p.i  +
-                    $out_tok * $p.o  +
-                    $cr_tok  * $p.cr +
-                    $cw5_tok * $p.cw5 +
-                    $cw1_tok * $p.cw1
-                  ) / 1000000) as $c
-                | {
-                    input_tokens: (.input_tokens + $in_tok),
-                    output_tokens: (.output_tokens + $out_tok),
-                    cache_read_tokens: (.cache_read_tokens + $cr_tok),
-                    cache_write_tokens: (.cache_write_tokens + $cw5_tok + $cw1_tok),
-                    cost_usd: (.cost_usd + $c),
-                    dispatch_count: (.dispatch_count + 1)
-                  }
-              )
-              | .cost_usd |= (. * 1000000 | round / 1000000 | tostring)
-            ' "${USAGE_FILES[@]}")
-          fi
-          echo "telemetry usage: $USAGE_JSON"
-
-          PAYLOAD=$(jq -nc \
-            --arg token "$TELEMETRY_TOKEN" \
-            --arg run_id "$RUN_ID" \
-            --arg pr "$PR_NUMBER" \
-            --slurpfile result "$RESULT" \
-            --argjson usage "$USAGE_JSON" '
-              ($result[0]) as $r
-              | {
-                  token: $token,
-                  run_id: $run_id,
-                  pr_number: $pr,
-                  verdict: $r.verdict,
-                  target: ($r.template // "n/a"),
-                  evidence_verdict: ($r.evidenceVerdict // "n/a"),
-                  evidence_retry: (($r.evidenceRetry // false) | tostring),
-                  unit_tests_ran: (($r.unitTests.ran // false) | tostring),
-                  unit_tests_passed: (($r.unitTests.passed // "n/a") | tostring),
-                  duration_ms: (($r.durations.totalMs // 0) | tostring),
-                  input_tokens: ($usage.input_tokens | tostring),
-                  output_tokens: ($usage.output_tokens | tostring),
-                  cache_read_tokens: ($usage.cache_read_tokens | tostring),
-                  cache_write_tokens: ($usage.cache_write_tokens | tostring),
-                  cost_usd: $usage.cost_usd,
-                  dispatch_count: ($usage.dispatch_count | tostring),
-                  timestamp: ($r.createdAt // (now | todate))
-                }
-            ')
-          # Log a token-redacted preview so the row is debuggable from
-          # the Action log without leaking the shared secret.
-          jq 'del(.token)' <<<"$PAYLOAD"
-
-          # Apps Script /exec POST returns 302 → script.googleusercontent.com
-          # /macros/echo where the response body lives. curl -L follows;
-          # crucially we DO NOT pass -X POST — that flag forces the method
-          # on EVERY request including the redirect, which makes the second
-          # hop POST to /echo and 405s. --data-binary alone implies POST
-          # for the first request, then curl downgrades to GET for the
-          # redirect (RFC 7231 §6.4.3 default). -f makes non-2xx a hard
-          # error. --max-time bounds the call.
-          RESPONSE=$(curl -sS -fL --max-time 30 \
-            -H 'Content-Type: application/json' \
-            --data-binary "$PAYLOAD" \
-            "$TELEMETRY_URL")
-          echo "telemetry response: $RESPONSE"
-          if ! jq -e '.ok == true' >/dev/null <<<"$RESPONSE"; then
-            echo "telemetry rejected: $RESPONSE" >&2
-            exit 1
-          fi
+          # POST one row per run to a Google Apps Script web app that
+          # appends to a Sheet (run_id, pr_number, verdict, target,
+          # evidence_verdict, evidence_retry, unit_tests_ran,
+          # unit_tests_passed, duration_ms, token counts, model, timestamp).
+          # Implementation lives in scripts/verify/ci/append-telemetry.ts —
+          # emits raw token counts only; Sheets/Apps Script downstream
+          # computes USD from token counts + model id so no pricing
+          # table lives in CI.
+          #
+          # No-ops when the webhook secrets aren't configured so forks
+          # without telemetry sinks don't fail this step.
+          node "$GITHUB_WORKSPACE/scripts/verify/ci/append-telemetry.ts" \
+            --result "$RESULT" \
+            --pr "$PR_NUMBER" \
+            --run-id "$RUN_ID" \
+            --dispatch-dir "$PR_HEAD_DIR/.verify-output" \
+            --dispatch-dir "$GITHUB_WORKSPACE/.verify-output" \
+            --curl-cfg "$RUNNER_TEMP/.curl-cfg"
 
       - name: Stage artifacts (rename dotdirs)
         # actions/upload-artifact v7 ships dotfiles into the zip, but
@@ -978,12 +871,24 @@ jobs:
         if: always()
         env:
           SCREENSHOT_URLS: ${{ steps.screenshots.outputs.urls }}
+          RESULT: ${{ steps.verify.outputs.result-path }}
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             const fs = require('fs');
-            const path = require('path');
             const url = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            // UC4: sanitize untrusted text (compile output, vitest stdout)
+            // before rendering in the PR comment. The pattern catches
+            // token-shaped substrings ("Bearer abcd1234…"), prefixed API
+            // keys (Anthropic / OpenAI / GitHub PAT / AWS access key)
+            // anywhere they may leak — postinstall errors, Authorization
+            // header echoes, etc.
+            const SECRET_RE = /(token|key|password|secret|bearer)[a-zA-Z0-9_-]+|sk-(ant|live|test)[a-zA-Z0-9_-]{20,}|gh[pousr]_[a-zA-Z0-9]{36,}|AKIA[A-Z0-9]{16}/gi;
+            function redact(text) {
+              if (text == null) return text;
+              return String(text).replace(SECRET_RE, '[REDACTED]');
+            }
 
             function renderScreenshots() {
               let raw = process.env.SCREENSHOT_URLS;
@@ -1003,18 +908,12 @@ jobs:
 
             let body;
             try {
-              const root = path.join(process.env.PR_HEAD_DIR || 'pr-head', '.verify-output');
-              const dirs = fs.existsSync(root)
-                ? fs.readdirSync(root, { withFileTypes: true })
-                    .filter((d) => d.isDirectory())
-                    .map((d) => d.name)
-                    .sort()
-                    .reverse()
-                : [];
-              const resultPath = dirs
-                .map((d) => path.join(root, d, 'verify-result.json'))
-                .find((p) => fs.existsSync(p));
-              if (!resultPath) {
+              // C5: read the trusted result path threaded via $GITHUB_OUTPUT
+              // by the Verify PR step. Globbing the PR-writable
+              // .verify-output tree would let a malicious recipe forge a
+              // verify-result.json with verdict=verified.
+              const resultPath = process.env.RESULT;
+              if (!resultPath || !fs.existsSync(resultPath)) {
                 body = `## Verify Harness\n\nNo verdict produced — the workflow failed before the harness ran (likely recipe-author dispatch, deny-regex, or lint). See [run log](${url}) for details.`;
               } else {
                 const verdict = JSON.parse(fs.readFileSync(resultPath, 'utf-8'));
@@ -1027,7 +926,7 @@ jobs:
                     }`
                   : '';
                 const detailsBlock = verdict.regressionDetails
-                  ? `\n\n<details><summary>Compile output (last 4KB)</summary>\n\n\`\`\`\n${String(verdict.regressionDetails).slice(0, 4000)}\n\`\`\`\n\n</details>`
+                  ? `\n\n<details><summary>Compile output (last 4KB)</summary>\n\n\`\`\`\n${redact(String(verdict.regressionDetails)).slice(0, 4000)}\n\`\`\`\n\n</details>`
                   : '';
                 let unitTestsLine = '';
                 if (verdict.unitTests && verdict.unitTests.ran) {
@@ -1037,10 +936,10 @@ jobs:
                     .join(', ');
                   unitTestsLine = `\n\nPR-added unit tests: ${status} — ${verdict.unitTests.summary || ''}${filesList ? `\n\nFiles: ${filesList}` : ''}`;
                   if (!verdict.unitTests.passed && verdict.unitTests.details) {
-                    unitTestsLine += `\n\n<details><summary>vitest output (last 4KB)</summary>\n\n\`\`\`\n${String(verdict.unitTests.details).slice(0, 4000)}\n\`\`\`\n\n</details>`;
+                    unitTestsLine += `\n\n<details><summary>vitest output (last 4KB)</summary>\n\n\`\`\`\n${redact(String(verdict.unitTests.details)).slice(0, 4000)}\n\`\`\`\n\n</details>`;
                   }
                 }
-                body = `## Verify Harness\n\nVerdict: \`${verdict.verdict}\` (target \`${verdict.template}\`)${verdict.regressionReason ? `\n\nReason: \`${verdict.regressionReason}\`` : ''}${detailsBlock}${evidenceLine}${unitTestsLine}\n\nReplay: \`npx playwright show-trace\` on the trace.zip listed under "Artifacts" on the [run summary page](${url}).${renderScreenshots()}`;
+                body = `## Verify Harness\n\nVerdict: \`${verdict.verdict}\` (target \`${verdict.template}\`)${verdict.regressionReason ? `\n\nReason: \`${redact(verdict.regressionReason)}\`` : ''}${detailsBlock}${evidenceLine}${unitTestsLine}\n\nReplay: \`npx playwright show-trace\` on the trace.zip listed under "Artifacts" on the [run summary page](${url}).${renderScreenshots()}`;
               }
             } catch (err) {
               body = `## Verify Harness\n\nError reading verdict: \`${err.message}\`. See [run log](${url}).`;
@@ -1052,11 +951,14 @@ jobs:
               body,
             });
 
-      - name: Fail job if final verdict is regression
+      - name: Fail job if final verdict is not verified
         # Preserve red-CI signal. Earlier Verify-PR step swallows non-zero
         # exit so retry can run; this terminal gate restores the fail
-        # signal based on the post-retry verdict.
-        if: always() && steps.verdict.outputs.verdict == 'regression'
+        # signal for ANY non-'verified' outcome (regression, evidence-missing,
+        # missing, etc.) so silent failure modes can't slip through green.
+        if: always() && steps.verdict.outputs.verdict != 'verified'
+        env:
+          VERDICT: ${{ steps.verdict.outputs.verdict }}
         run: |
-          echo "Final verdict: regression — failing job."
+          echo "Final verdict: ${VERDICT:-<empty>} — failing job."
           exit 1

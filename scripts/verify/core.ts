@@ -5,6 +5,13 @@ import * as fs from 'node:fs/promises';
 
 export const SCHEMA_VERSION = 2;
 
+// CSI / SGR ANSI escape stripper shared by entry script + CI helpers so log
+// tails render cleanly in PR comments.
+export const ANSI_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
+export function stripAnsi(input: string): string {
+  return input.replace(ANSI_RE, '');
+}
+
 export type StepStatus = 'passed' | 'failed' | 'skipped' | 'timedOut';
 
 export interface RecipeStep {
@@ -36,6 +43,7 @@ export interface VerifyResult {
   schemaVersion: number;
   runId: string;
   verdict: 'verified' | 'regression' | 'skipped';
+  notes?: string[];
   regressionReason?: string;
   /**
    * Long-form context for the regression (compile/boot output tail, error
@@ -65,12 +73,7 @@ export interface RunPaths {
 
 export function buildRunPaths(runId?: string, baseDir?: string): RunPaths {
   const resolvedBaseDir = baseDir ?? path.resolve(process.cwd(), '.verify-output');
-  const resolvedRunId =
-    runId ??
-    new Date()
-      .toISOString()
-      .replace(/:/g, '-')
-      .replace(/\.\d{3}Z$/, (m) => m);
+  const resolvedRunId = runId ?? new Date().toISOString().replace(/:/g, '-');
   const runDir = path.join(resolvedBaseDir, resolvedRunId);
   return {
     runId: resolvedRunId,
@@ -84,9 +87,19 @@ export async function ensureRunDir(paths: RunPaths): Promise<void> {
   await fs.mkdir(paths.runDir, { recursive: true });
 }
 
-export async function writeResult(paths: RunPaths, result: VerifyResult): Promise<void> {
-  await ensureRunDir(paths);
-  await fs.writeFile(paths.resultJson, JSON.stringify(result, null, 2) + '\n', 'utf-8');
+export async function writeResult(
+  paths: RunPaths,
+  result: VerifyResult,
+  outputDir?: string
+): Promise<void> {
+  const resultJson = outputDir ? path.join(outputDir, 'verify-result.json') : paths.resultJson;
+  await fs.mkdir(path.dirname(resultJson), { recursive: true });
+  await fs.writeFile(resultJson, JSON.stringify(result, null, 2) + '\n', 'utf-8');
+}
+
+export function appendNote(result: VerifyResult, note: string): void {
+  result.notes ??= [];
+  result.notes.push(note);
 }
 
 /**
@@ -103,7 +116,8 @@ export async function writeRegressionResult(
     details?: string;
     recipeSpecPath?: string;
     durations?: Durations;
-  }
+  },
+  outputDir?: string
 ): Promise<void> {
   const result: VerifyResult = {
     schemaVersion: SCHEMA_VERSION,
@@ -127,7 +141,7 @@ export async function writeRegressionResult(
   if (opts?.details && opts.details.length > 0) {
     result.regressionDetails = opts.details;
   }
-  await writeResult(paths, result);
+  await writeResult(paths, result, outputDir);
 }
 
 export function computeVerdict(tests: RecipeTest[]): 'verified' | 'regression' {

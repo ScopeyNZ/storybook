@@ -56,12 +56,16 @@ the supported authoring entry point for ambiguous changes.
 
 ## v6 isolation posture
 
-v6 runs both the authoring step and the verify step on a stock GitHub
-Actions ephemeral runner — **the same isolation profile as the existing
-Storybook PR CI**, which already executes untrusted contributor code as
-part of normal test runs. No Docker, no Verdaccio, no sandbox-runtime.
+v6 runs the authoring step on the trusted base checkout and wraps every
+PR-controlled step — `yarn install`, `yarn nx compile`, `yarn nx run
+<tpl>:sandbox`, and the Playwright recipe itself — in
+`@anthropic-ai/sandbox-runtime` (`srt`, bubblewrap on Linux). Each `srt`
+invocation runs under `env -i` so `ACTIONS_*` tokens and other runner
+secrets are stripped before the untrusted process boots. This is
+**Layer-2** isolation on top of the Layer-1 controls (deny-regex, ESLint
+policy, `enableScripts: false`, committed lockfile, scoped API keys).
 
-The previous v5-0 container (`--cap-drop ALL`, `--network=none`,
+The previous v5-0 Docker container (`--cap-drop ALL`, `--network=none`,
 `--read-only`, `--tmpfs`, `--user 1000:1000`) was dropped because:
 
 - The supply-chain ceremony it added (digest pins, harden-build-context
@@ -69,25 +73,28 @@ The previous v5-0 container (`--cap-drop ALL`, `--network=none`,
   asymmetric to the runtime risk. `enableScripts: false`, the
   committed lockfile, and the `.npmrc` purge already cover that
   surface.
-- The container's runtime isolation flags addressed a threat
-  (untrusted-PR code execution with cross-tenant blast radius) that
-  doesn't apply to a per-PR ephemeral runner.
 - BuildKit's layer-isolation behaviour proved fragile across 11
   firetest rounds — `code/core/dist` repeatedly disappeared between
   stages.
 
-## When to add stronger isolation
+`srt` replaces the container with a process-level jail: bubblewrap mount
+namespaces give FS isolation without the BuildKit fragility, and its
+network policy lets us deny egress everywhere except localhost (so the
+Playwright recipe can hit the dev server but the recipe code itself
+cannot exfiltrate).
 
-If the threat model expands to processing third-party PRs at scale
-with adversarial recipe authors, wrap the playwright test step in
-`sandbox-runtime` (bubblewrap on Linux) — ~10 lines of config per
-Anthropic's "Securely deploying AI agents" doc. Do **not** reintroduce
-the full Docker + Verdaccio stack.
+## When to tighten further
 
-Network egress on the runner is unrestricted today (matching the rest of
-upstream CI). If the deny-regex + lint gates are ever judged insufficient,
-the simplest hardening is a runner-level egress allowlist (npm registry,
-GitHub, Playwright browser CDN) rather than container reintroduction.
+`srt` settings live in the workflow under `Build sandbox settings` and
+are version-pinned via `npm install -g @anthropic-ai/sandbox-runtime@<v>`
+plus a post-install sha256 check (see §pinning-sandbox-runtime). If
+sandbox policy needs to tighten, edit those settings and the smoke step
+will fail-closed if the jail config drifts.
+
+Network egress from the recipe is restricted by the srt jail
+(`allowedDomains: ["localhost", "127.0.0.1"]`). The compile / install
+steps still need npm + GitHub access; that traffic is allowed but runs
+without `ACTIONS_*` credentials thanks to `env -i`.
 
 ## Sensitive-path exclusion
 
