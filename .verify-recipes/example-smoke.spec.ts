@@ -1,5 +1,5 @@
 // @verify-target: internal-ui
-import { RecipePage, expect, test } from './_util.ts';
+import { RecipePage, expect, filterPageErrors, test } from './_util.ts';
 
 test('example-button--primary renders without runtime errors', async ({ page }, testInfo) => {
   const pageErrors: string[] = [];
@@ -47,5 +47,5 @@ test('example-button--primary renders without runtime errors', async ({ page }, 
     });
   }
 
-  expect(pageErrors).toEqual([]);
+  expect(filterPageErrors(pageErrors)).toEqual([]);
 });

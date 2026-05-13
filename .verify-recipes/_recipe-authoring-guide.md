@@ -13,7 +13,7 @@ Emit **one file** at the path specified by the skill: `.verify-recipes/pr-<#>.sp
 Required shape:
 
 ```ts
-import { RecipePage, expect, test } from './_util.ts';
+import { RecipePage, expect, filterPageErrors, test } from './_util.ts';
 
 test('<short imperative description>', async ({ page }, testInfo) => {
   // ... see rules below ...
@@ -22,7 +22,7 @@ test('<short imperative description>', async ({ page }, testInfo) => {
 
 Hard requirements:
 
-- **Imports**: ONLY `./_util.ts` (which re-exports `expect` + a `test` extended with the harness's auto-failure-capture fixture — captures the preview iframe accessibility snapshot to `iframe-snapshot.md` so the retry loop can feed it back to the next author dispatch). Nothing else. No `node:*`, no `child_process`, no `fs`, no `@storybook/*`, no relative imports outside `.verify-recipes/`. Do not import `test` or `expect` directly from `@playwright/test`; that bypasses the failure-capture fixture.
+- **Imports**: ONLY `./_util.ts` (which re-exports `expect`, `filterPageErrors`, and a `test` extended with the harness's auto-failure-capture fixture — captures the preview iframe accessibility snapshot to `iframe-snapshot.md` so the retry loop can feed it back to the next author dispatch). Nothing else. No `node:*`, no `child_process`, no `fs`, no `@storybook/*`, no relative imports outside `.verify-recipes/`. Do not import `test` or `expect` directly from `@playwright/test`; that bypasses the failure-capture fixture.
 - **Exactly one `test(...)` call.** No `describe`, no `test.skip`, no `test.only`, no `beforeEach`/`afterEach`.
 - **`.ts` extension on relative imports** (`./_util.ts`, not `./_util`).
 - **No top-level side effects** — everything inside the `test(...)` callback.
@@ -83,6 +83,24 @@ try {
 ```
 
 Attachment names are exactly `pageErrors` and `consoleErrors`. The body is JSON-stringified array of strings (already accumulated by the listeners).
+
+### Filtering known low-signal pageErrors
+
+When you assert `pageErrors` at the end of the recipe, wrap the array in
+`filterPageErrors(...)` from `./_util.ts`:
+
+```ts
+expect(filterPageErrors(pageErrors)).toEqual([]);
+```
+
+`filterPageErrors` drops upstream-known noise — currently the cross-origin
+`SecurityError: Failed to read the 'sessionStorage' property from 'Window'`
+that `@storybook/addon-mcp` emits on every internal-ui boot when its
+composed-ref auth probe touches chromatic-hosted iframes. The runner's
+`computeVerdict` applies the same filter on the attachment side, so
+**`filterPageErrors(pageErrors)` keeps the local assertion in sync with the
+runner's verdict logic** and prevents a "regression" verdict driven entirely
+by environmental noise. Never assert on the raw `pageErrors` array.
 
 ---
 
@@ -188,7 +206,7 @@ Before emitting the spec, work through the following four questions explicitly:
    - **Theme / dark-mode** — pass `?globals=theme:dark` in the URL or set the theme via `manager-api` once the manager mounts.
    - **Focus / hover / keyboard-only states** — use `.focus()`, `.hover()`, `page.keyboard.press('Tab')`. Many a11y-related PRs only render their change in these states.
    - **Specific story route** — when the diff names a specific component, navigate to the story that mounts it, not the generic `example-button--primary`.
-3. **Before deciding the trigger state is unreachable, walk through every affordance listed in the next subsection.** For each one, decide whether it applies to this diff. Most "I can't do this without `fs.*`" assumptions turn out to be wrong because Storybook's own in-app machinery exposes a path: Save from Controls writes story files via csf-tools, `page.evaluate` reaches manager-api setters, URL globals flip theme/args, and so on. **Only after explicitly considering each affordance and rejecting it with a one-sentence reason** may you fall back to: render the surrounding container, assert `#sb-errordisplay` is hidden, assert `expect(pageErrors).toEqual([])`. The bare phrase "working-tree mutation required" is **not** a valid fallback justification — Save from Controls satisfies that exact need without ever touching `fs.*`. The fallback is reserved for cases where (a) the diff is non-visual at all (pure type/logic refactor), or (b) the visible effect depends on env state outside the runner's reach. Either way, state the rejected affordances in the spec comment so a reviewer can audit the reasoning.
+3. **Before deciding the trigger state is unreachable, walk through every affordance listed in the next subsection.** For each one, decide whether it applies to this diff. Most "I can't do this without `fs.*`" assumptions turn out to be wrong because Storybook's own in-app machinery exposes a path: Save from Controls writes story files via csf-tools, `page.evaluate` reaches manager-api setters, URL globals flip theme/args, and so on. **Only after explicitly considering each affordance and rejecting it with a one-sentence reason** may you fall back to: render the surrounding container, assert `#sb-errordisplay` is hidden, assert `expect(filterPageErrors(pageErrors)).toEqual([])`. The bare phrase "working-tree mutation required" is **not** a valid fallback justification — Save from Controls satisfies that exact need without ever touching `fs.*`. The fallback is reserved for cases where (a) the diff is non-visual at all (pure type/logic refactor), or (b) the visible effect depends on env state outside the runner's reach. Either way, state the rejected affordances in the spec comment so a reviewer can audit the reasoning.
 4. **Screenshot the region containing the changed UI**, not the whole page. Use `locator.screenshot({ path: testInfo.outputPath('<name>.png') })` against the parent of the changed element (e.g. `.sidebar-container` for sidebar diffs, the addon-panel locator for addon panels, the docs `[role="table"]` for ArgsTable changes). Full-page or generic preview screenshots are acceptable only for layout-wide changes. The PR comment renders every screenshot you attach inline — reviewers should see the change in the image.
 
 ### Affordances Playwright recipes have for setting up trigger state
@@ -265,7 +283,7 @@ await page.locator('.sidebar-container').screenshot({
 });
 ```
 
-This pattern (Save from Controls → wait for status flip → screenshot the now-visible UI) is the canonical answer for any diff that touches change-detection-gated UI. The closing `expect(pageErrors).toEqual([])` in the standard footer covers module-resolution as a free bonus.
+This pattern (Save from Controls → wait for status flip → screenshot the now-visible UI) is the canonical answer for any diff that touches change-detection-gated UI. The closing `expect(filterPageErrors(pageErrors)).toEqual([])` in the standard footer covers module-resolution as a free bonus.
 
 ---
 
@@ -293,7 +311,7 @@ After you emit your spec body, the `verify-recipe-author` skill prepends a block
 
 ## 11. Worked example (reference shape)
 
-See `.verify-recipes/example-smoke.spec.ts` for the canonical minimum. Your output should look structurally similar: listeners → goto → `waitUntilLoaded` → assertions → `finally` attach → `expect(pageErrors).toEqual([])`.
+See `.verify-recipes/example-smoke.spec.ts` for the canonical minimum. Your output should look structurally similar: listeners → goto → `waitUntilLoaded` → assertions → `finally` attach → `expect(filterPageErrors(pageErrors)).toEqual([])`.
 
 ---
 

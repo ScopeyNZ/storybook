@@ -92,3 +92,24 @@ export const test = baseTest.extend<{ recipeFailureCapture: void }>({
 });
 
 export const expect = baseExpect;
+
+/**
+ * Drop pre-existing environmental pageErrors that the manager surfaces in
+ * CI through no fault of the PR under test. Use this on the array captured
+ * by `page.on('pageerror', ...)` before the final assertion:
+ *
+ *   expect(filterPageErrors(pageErrors)).toEqual([]);
+ *
+ * Known low-signal entries:
+ *  - `SecurityError: Failed to read the 'sessionStorage' property from
+ *    'Window': Access is denied for this document.` — `@storybook/addon-mcp`
+ *    probes cross-origin composed refs (chromatic-hosted iframes) loaded by
+ *    internal-ui's main.ts. The denial fires on every internal-ui boot.
+ */
+export function filterPageErrors(pageErrors: readonly string[]): string[] {
+  return pageErrors.filter((entry) => !isLowSignalPageError(entry));
+}
+
+function isLowSignalPageError(text: string): boolean {
+  return /SecurityError:\s*Failed to read the 'sessionStorage' property from 'Window'/.test(text);
+}
