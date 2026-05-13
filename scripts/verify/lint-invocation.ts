@@ -8,6 +8,7 @@
 // (the `bin/eslint.js` subpath is blocked by eslint's exports field).
 
 import { spawn } from 'node:child_process';
+import * as fs from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -98,6 +99,25 @@ export async function lintRecipeSpec(
   const absSpecPath = path.isAbsolute(options.specPath)
     ? options.specPath
     : path.resolve(repoRoot, options.specPath);
+
+  // Ensure the local `eslint-plugin-verify-recipes` (lives under
+  // .verify-recipes/eslint-plugin/) is reachable via `node_modules` for
+  // ESLint's plugin resolver. The plugin is not published to npm and not a
+  // yarn workspace package, so we symlink it on demand. Idempotent.
+  const pluginsRootDir = path.join(repoRoot, 'node_modules');
+  const pluginLinkPath = path.join(pluginsRootDir, 'eslint-plugin-verify-recipes');
+  const pluginSrcPath = path.join(repoRoot, '.verify-recipes', 'eslint-plugin');
+  if (!fs.existsSync(pluginLinkPath) && fs.existsSync(pluginSrcPath)) {
+    try {
+      fs.mkdirSync(pluginsRootDir, { recursive: true });
+      fs.symlinkSync(pluginSrcPath, pluginLinkPath, 'dir');
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'EEXIST') {
+        throw err;
+      }
+    }
+  }
 
   const eslintBin = resolveEslintBin();
   const args = buildArgs(absSpecPath, repoRoot);
