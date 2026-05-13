@@ -190,14 +190,19 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
-      - name: Sync trusted .verify-recipes helpers into PR head
+      - name: Sync trusted harness code into PR head
         # The authored spec imports `./_util.ts` (which re-exports `expect`
         # + a `test` extended with the auto-failure-capture fixture). The
         # PR-head checkout has a copy of `_util.ts` at the SHA the PR
         # branched from, which lags behind the base branch's harness
         # iteration. Always overwrite with the base-branch version so the
-        # spec runs against the current util contract. example-smoke.spec.ts
-        # is copied alongside so reference recipes stay aligned.
+        # spec runs against the current util contract.
+        #
+        # Also sync the trusted entry script + scripts/verify/* tree so the
+        # `yarn verify-pr` invocation (run from $PR_HEAD_DIR) executes the
+        # current base-branch harness code, not whatever was on the PR-head
+        # branch tip. Without this, hardening fixes to scripts/verify-pr.ts
+        # / scripts/verify/* don't take effect for older PR branches.
         run: |
           set -euo pipefail
           mkdir -p "$PR_HEAD_DIR/.verify-recipes"
@@ -211,6 +216,27 @@ jobs:
               exit 1
             fi
             cp --no-dereference --remove-destination ".verify-recipes/$f" "$dest"
+          done
+          # Sync trusted harness scripts. These are the load-bearing code
+          # paths for verdict computation, recipe execution, target
+          # routing, and result-file writing. The PR cannot legitimately
+          # need a different version — overwrite unconditionally.
+          mkdir -p "$PR_HEAD_DIR/scripts/verify"
+          mkdir -p "$PR_HEAD_DIR/scripts/utils"
+          # Refuse symlink shadows on each target before cp.
+          for rel in scripts/verify-pr.ts scripts/verify-pr-author.ts \
+                     scripts/verify-pr-generate.ts scripts/verify-evidence-check.ts; do
+            dest="$PR_HEAD_DIR/$rel"
+            [ -L "$dest" ] && { echo "[sync] refusing to overwrite symlink at $dest" >&2; exit 1; }
+            cp --no-dereference --remove-destination "$rel" "$dest"
+          done
+          # Tree-level overwrite for the verify/ and utils/ subtrees.
+          # Remove any existing PR-head copy first so a symlink shadow at
+          # an internal path can't redirect the write.
+          for sub in scripts/verify scripts/utils; do
+            [ -L "$PR_HEAD_DIR/$sub" ] && { echo "[sync] refusing to overwrite symlink dir at $PR_HEAD_DIR/$sub" >&2; exit 1; }
+            rm -rf "$PR_HEAD_DIR/$sub"
+            cp -aT "$sub" "$PR_HEAD_DIR/$sub"
           done
 
       - name: Install sandbox-runtime (Layer-2)
