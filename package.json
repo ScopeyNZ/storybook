@@ -37,6 +37,7 @@
     "test": "NODE_OPTIONS=--max_old_space_size=4096 vitest run",
     "test:watch": "NODE_OPTIONS=--max_old_space_size=4096 vitest watch",
     "upload-bench": "cd scripts; yarn upload-bench",
+    "verify-evidence-check": "node scripts/verify-evidence-check.ts",
     "verify-pr": "node ./scripts/verify-pr.ts",
     "verify-pr-author": "node scripts/verify-pr-author.ts",
     "verify-pr-generate": "bun scripts/verify-pr-generate.ts",
