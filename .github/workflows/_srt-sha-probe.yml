@@ -7,6 +7,9 @@ name: srt sha probe (one-off)
 # Trigger: gh workflow run _srt-sha-probe.yml --repo <owner>/storybook --ref <branch>
 
 on:
+  push:
+    branches: [valentin/agentic-review-harness]
+    paths: ['.github/workflows/_srt-sha-probe.yml']
   workflow_dispatch:
     inputs:
       srt_version:
@@ -24,7 +27,8 @@ jobs:
       - name: Install sandbox-runtime
         run: |
           set -euo pipefail
-          sudo npm install -g --ignore-scripts "@anthropic-ai/sandbox-runtime@${{ inputs.srt_version }}"
+          SRT_VERSION="${{ inputs.srt_version || '0.0.51' }}"
+          sudo npm install -g --ignore-scripts "@anthropic-ai/sandbox-runtime@${SRT_VERSION}"
           srt --version
       - name: Compute sha256
         run: |
