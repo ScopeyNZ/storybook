@@ -1,0 +1,46 @@
+name: srt sha probe (one-off)
+# Manual-dispatch workflow that installs @anthropic-ai/sandbox-runtime
+# at the pinned version and prints its sha256. Use the printed value to
+# populate EXPECTED_SRT_SHA in .github/workflows/verify-pr.yml, then
+# delete this file.
+#
+# Trigger: gh workflow run _srt-sha-probe.yml --repo <owner>/storybook --ref <branch>
+
+on:
+  workflow_dispatch:
+    inputs:
+      srt_version:
+        description: 'sandbox-runtime version to probe'
+        required: true
+        default: '0.0.51'
+
+permissions: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Install sandbox-runtime
+        run: |
+          set -euo pipefail
+          sudo npm install -g --ignore-scripts "@anthropic-ai/sandbox-runtime@${{ inputs.srt_version }}"
+          srt --version
+      - name: Compute sha256
+        run: |
+          set -euo pipefail
+          which_srt="$(which srt)"
+          # `srt` is a node shim that may resolve to a symlink — hash the
+          # resolved file so the value matches what `sha256sum $(which srt)`
+          # produces during the verify-pr.yml integrity check.
+          resolved="$(readlink -f "$which_srt")"
+          echo "[srt-probe] which srt: $which_srt"
+          echo "[srt-probe] resolved : $resolved"
+          actual="$(sha256sum "$which_srt" | cut -d' ' -f1)"
+          echo "[srt-probe] sha256(which) = $actual"
+          if [ "$which_srt" != "$resolved" ]; then
+            actual_resolved="$(sha256sum "$resolved" | cut -d' ' -f1)"
+            echo "[srt-probe] sha256(resolved) = $actual_resolved"
+          fi
+          # Emit a marker line that's easy to grep from the run log.
+          echo "::notice title=EXPECTED_SRT_SHA::EXPECTED_SRT_SHA=$actual"
