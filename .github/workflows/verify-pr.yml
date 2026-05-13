@@ -808,11 +808,25 @@ jobs:
             USAGE_JSON='{"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0,"cost_usd":"0.000000","dispatch_count":0}'
           else
             USAGE_JSON=$(jq -s '
+              # USD per million tokens, current Anthropic pricing.
+              #   i   = base input
+              #   o   = output
+              #   cr  = cache hits + refreshes (read)
+              #   cw5 = 5-minute cache writes (SDK default)
+              #   cw1 = 1-hour cache writes (extended cache)
               def prices:
                 {
-                  "claude-sonnet-4-5":     {"i": 3.00,  "o": 15.00, "cr": 0.30, "cw": 3.75},
-                  "claude-haiku-4-5":      {"i": 0.80,  "o": 4.00,  "cr": 0.08, "cw": 1.00},
-                  "claude-opus-4-7":       {"i": 15.00, "o": 75.00, "cr": 1.50, "cw": 18.75}
+                  "claude-opus-4-7":    {"i": 5.00,  "o": 25.00, "cr": 0.50, "cw5": 6.25, "cw1": 10.00},
+                  "claude-opus-4-6":    {"i": 5.00,  "o": 25.00, "cr": 0.50, "cw5": 6.25, "cw1": 10.00},
+                  "claude-opus-4-5":    {"i": 5.00,  "o": 25.00, "cr": 0.50, "cw5": 6.25, "cw1": 10.00},
+                  "claude-opus-4-1":    {"i": 15.00, "o": 75.00, "cr": 1.50, "cw5": 18.75, "cw1": 30.00},
+                  "claude-opus-4":      {"i": 15.00, "o": 75.00, "cr": 1.50, "cw5": 18.75, "cw1": 30.00},
+                  "claude-sonnet-4-6":  {"i": 3.00,  "o": 15.00, "cr": 0.30, "cw5": 3.75, "cw1": 6.00},
+                  "claude-sonnet-4-5":  {"i": 3.00,  "o": 15.00, "cr": 0.30, "cw5": 3.75, "cw1": 6.00},
+                  "claude-sonnet-4":    {"i": 3.00,  "o": 15.00, "cr": 0.30, "cw5": 3.75, "cw1": 6.00},
+                  "claude-haiku-4-5":   {"i": 1.00,  "o": 5.00,  "cr": 0.10, "cw5": 1.25, "cw1": 2.00},
+                  "claude-haiku-3-5":   {"i": 0.80,  "o": 4.00,  "cr": 0.08, "cw5": 1.00, "cw1": 1.60},
+                  "claude-haiku-3":     {"i": 0.25,  "o": 1.25,  "cr": 0.03, "cw5": 0.30, "cw1": 0.50}
                 };
               # Strip trailing -YYYYMMDD date suffix that Anthropic
               # ships alongside the rolling alias (e.g. claude-haiku-4-5
@@ -822,18 +836,25 @@ jobs:
               reduce .[] as $r (
                 {input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, cost_usd: 0, dispatch_count: 0};
                 ($r.usage // {}) as $u
-                | (prices[model_key($r.model)] // {"i":0,"o":0,"cr":0,"cw":0}) as $p
+                | (prices[model_key($r.model)] // {"i":0,"o":0,"cr":0,"cw5":0,"cw1":0}) as $p
+                # SDK exposes a breakdown under .cache_creation when extended
+                # cache is enabled; otherwise the total lands in
+                # .cache_creation_input_tokens and we charge it at the 5m rate
+                # (the SDK default TTL).
+                | (($u.cache_creation.ephemeral_5m_input_tokens // null) // ($u.cache_creation_input_tokens // 0)) as $cw5_tok
+                | ($u.cache_creation.ephemeral_1h_input_tokens // 0) as $cw1_tok
                 | (
                     ($u.input_tokens // 0) * $p.i +
                     ($u.output_tokens // 0) * $p.o +
                     ($u.cache_read_input_tokens // 0) * $p.cr +
-                    ($u.cache_creation_input_tokens // 0) * $p.cw
+                    $cw5_tok * $p.cw5 +
+                    $cw1_tok * $p.cw1
                   ) / 1000000 as $c
                 | {
                     input_tokens: (.input_tokens + ($u.input_tokens // 0)),
                     output_tokens: (.output_tokens + ($u.output_tokens // 0)),
                     cache_read_tokens: (.cache_read_tokens + ($u.cache_read_input_tokens // 0)),
-                    cache_write_tokens: (.cache_write_tokens + ($u.cache_creation_input_tokens // 0)),
+                    cache_write_tokens: (.cache_write_tokens + $cw5_tok + $cw1_tok),
                     cost_usd: (.cost_usd + $c),
                     dispatch_count: (.dispatch_count + 1)
                   }
