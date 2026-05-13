@@ -796,11 +796,18 @@ jobs:
           # the price table is hardcoded so a price change requires a
           # workflow edit (Anthropic's pricing is stable enough that
           # this is acceptable for v8 prioritisation telemetry).
+          # Dispatch artifacts land in two places:
+          #   - recipe-author writes dispatch-response.json under
+          #     $GITHUB_WORKSPACE/.verify-output (verify-pr-author runs
+          #     from the trusted base checkout)
+          #   - evidence-check writes evidence-check-response.json under
+          #     $PR_HEAD_DIR/.verify-output (the result lives there)
+          # Scan both.
           USAGE_FILES=()
           while IFS= read -r f; do
             [ -n "$f" ] && USAGE_FILES+=("$f")
           done < <(
-            find "$PR_HEAD_DIR/.verify-output" -type f \
+            find "$PR_HEAD_DIR/.verify-output" "$GITHUB_WORKSPACE/.verify-output" -type f \
               \( -name 'dispatch-response.json' -o -name 'evidence-check-response.json' \) \
               2>/dev/null | sort
           )
