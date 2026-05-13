@@ -840,6 +840,14 @@ jobs:
               # -20251001 → claude-haiku-4-5).
               def model_key($m):
                 ($m // "") | sub("-2025[0-9]+$"; "") | sub("-2026[0-9]+$"; "");
+              # Coerce any SDK field to a non-negative number. Anthropic
+              # has shipped JSON shapes where a field that was previously
+              # numeric becomes null (or even an object); without this
+              # guard the arithmetic below blew up with "number and object
+              # cannot be divided" on jq 1.6 / 1.7 even though jq 1.8
+              # accepted it.
+              def num($x):
+                ($x | if type == "number" then . else 0 end);
               reduce .[] as $r (
                 {input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0, cost_usd: 0, dispatch_count: 0};
                 ($r.usage // {}) as $u
@@ -848,19 +856,24 @@ jobs:
                 # cache is enabled; otherwise the total lands in
                 # .cache_creation_input_tokens and we charge it at the 5m rate
                 # (the SDK default TTL).
-                | (($u.cache_creation.ephemeral_5m_input_tokens // null) // ($u.cache_creation_input_tokens // 0)) as $cw5_tok
-                | ($u.cache_creation.ephemeral_1h_input_tokens // 0) as $cw1_tok
+                | (num($u.cache_creation.ephemeral_5m_input_tokens)) as $cw5_5m
+                | (num($u.cache_creation_input_tokens)) as $cw5_legacy
+                | (if $cw5_5m > 0 then $cw5_5m else $cw5_legacy end) as $cw5_tok
+                | (num($u.cache_creation.ephemeral_1h_input_tokens)) as $cw1_tok
+                | (num($u.input_tokens)) as $in_tok
+                | (num($u.output_tokens)) as $out_tok
+                | (num($u.cache_read_input_tokens)) as $cr_tok
                 | (
-                    ($u.input_tokens // 0) * $p.i +
-                    ($u.output_tokens // 0) * $p.o +
-                    ($u.cache_read_input_tokens // 0) * $p.cr +
+                    $in_tok  * $p.i  +
+                    $out_tok * $p.o  +
+                    $cr_tok  * $p.cr +
                     $cw5_tok * $p.cw5 +
                     $cw1_tok * $p.cw1
                   ) / 1000000 as $c
                 | {
-                    input_tokens: (.input_tokens + ($u.input_tokens // 0)),
-                    output_tokens: (.output_tokens + ($u.output_tokens // 0)),
-                    cache_read_tokens: (.cache_read_tokens + ($u.cache_read_input_tokens // 0)),
+                    input_tokens: (.input_tokens + $in_tok),
+                    output_tokens: (.output_tokens + $out_tok),
+                    cache_read_tokens: (.cache_read_tokens + $cr_tok),
                     cache_write_tokens: (.cache_write_tokens + $cw5_tok + $cw1_tok),
                     cost_usd: (.cost_usd + $c),
                     dispatch_count: (.dispatch_count + 1)
