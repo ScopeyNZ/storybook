@@ -20,10 +20,8 @@ import type {
   PromptReferenceSpec,
 } from './verify/agent-prompt.ts';
 import { matchedTriageGlobs, triageReferenceSpecs } from './verify/triage.ts';
-import {
-  deriveRoutesForFiles,
-  type StoryFileRoutes,
-} from './verify/derive-story-routes.ts';
+import { deriveRoutesForFiles, type StoryFileRoutes } from './verify/derive-story-routes.ts';
+import { suggestVerifyTarget, type TargetSuggestion } from './verify/target-suggest.ts';
 
 const repoRoot = path.resolve(import.meta.dirname, '..');
 const RECIPES_DIR = path.resolve(repoRoot, '.verify-recipes');
@@ -339,9 +337,7 @@ function renderTouchedSourceFilesSection(filePaths: string[]): string {
     }
     const lines = source.split('\n');
     const capped = lines.length > TOUCHED_SOURCE_FILE_LINE_CAP;
-    const slice = capped
-      ? lines.slice(0, TOUCHED_SOURCE_FILE_LINE_CAP).join('\n')
-      : source;
+    const slice = capped ? lines.slice(0, TOUCHED_SOURCE_FILE_LINE_CAP).join('\n') : source;
     const trailer = capped
       ? `\n// ... (${lines.length - TOUCHED_SOURCE_FILE_LINE_CAP} more lines elided)`
       : '';
@@ -362,6 +358,33 @@ function renderTouchedSourceFilesSection(filePaths: string[]): string {
     '',
     ...populated,
   ].join('\n');
+}
+
+function renderTargetSuggestionSection(suggestion: TargetSuggestion): string {
+  const lines: string[] = [
+    '## Recommended verify-target (computed deterministically from changed paths)',
+    '',
+    `**Recommended target:** \`${suggestion.target}\``,
+    '',
+    `**Rationale:** ${suggestion.rationale}`,
+  ];
+  if (suggestion.matchedGlobs.length > 0) {
+    lines.push('', '**Matched globs:**');
+    for (const glob of suggestion.matchedGlobs) {
+      lines.push(`- \`${glob}\``);
+    }
+  }
+  lines.push(
+    '',
+    'Use this value as the spec header — i.e. the first non-empty line of the spec MUST be:',
+    '',
+    '```ts',
+    `// @verify-target: ${suggestion.target}`,
+    '```',
+    '',
+    'Override the recommendation only if you have a concrete reason rooted in the diff (state it in a single-line comment in the spec body). See the authoring guide §12 "Target selection" for the full mapping; in particular note the `nextjs` vs `nextjs-vite` hard gate — they are separate packages with incompatible builders.'
+  );
+  return lines.join('\n');
 }
 
 function renderStoryRoutesSection(routes: StoryFileRoutes[]): string {
@@ -526,6 +549,13 @@ async function main(argv: string[]): Promise<number> {
   };
 
   let prompt = buildRecipeAuthorPrompt(promptInput);
+
+  // Deterministic verify-target suggestion derived from changed paths. The
+  // agent still emits its own `// @verify-target:` header, but surfacing
+  // the harness's recommendation in the prompt removes guesswork on
+  // framework-specific routing (e.g. nextjs vs nextjs-vite).
+  const targetSuggestion = suggestVerifyTarget(prMeta.files.map((f) => f.path));
+  prompt = `${prompt}\n\n---\n\n${renderTargetSuggestionSection(targetSuggestion)}`;
 
   // Pre-compute canonical story routes for files touched by the diff (and
   // siblings of non-stories source files). Storybook auto-title + toId are

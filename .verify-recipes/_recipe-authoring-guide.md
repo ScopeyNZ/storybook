@@ -315,19 +315,41 @@ the **first non-empty line** of the spec:
 
 **Strong sandbox-target signals (pick `sandbox:<template>` when):**
 - Diff touches `code/renderers/<r>/template/cli/**` or `code/frameworks/<r>/template/cli/**` — these files only exist inside generated sandboxes; internal-ui never imports them.
-- Diff touches build/runtime code of a non-react renderer or framework (`code/renderers/vue3/src/**`, `code/frameworks/svelte-vite/src/**`, `code/frameworks/nextjs/src/**`, …) where internal-ui has no equivalent story.
+- Diff touches build/runtime code of a non-react renderer or framework (`code/renderers/vue3/src/**`, `code/frameworks/svelte-vite/src/**`, `code/frameworks/nextjs/src/**`, `code/frameworks/nextjs-vite/src/**`, …) where internal-ui has no equivalent story.
 
 Pick the matching template:
 - `code/renderers/vue3/**` or `code/frameworks/vue3-vite/**` → `sandbox:vue3-vite/default-ts`
 - `code/renderers/svelte/**` or `code/frameworks/svelte-vite/**` → `sandbox:svelte-vite/default-ts`
-- `code/frameworks/nextjs/**` → `sandbox:nextjs/default-ts`
+- `code/frameworks/nextjs-vite/**` → `sandbox:nextjs-vite/default-ts` (Vite-based Next.js builder; **do NOT pick `sandbox:nextjs/default-ts` for nextjs-vite changes** — the webpack-based nextjs sandbox compile-fails on nextjs-vite-specific code paths)
+- `code/frameworks/nextjs/**` → `sandbox:nextjs/default-ts` (webpack-based Next.js; reserve for changes scoped to the webpack framework only)
 - `code/renderers/react/**` only when internal-ui can't reach the change → `sandbox:react-vite/default-ts`
 
 If you choose `sandbox:<template>`, use a template the repo lists in
 `code/lib/cli-storybook/src/sandbox-templates.ts`. The workflow allowlists:
 `react-vite/default-ts`, `react-webpack/default-ts`,
 `vue3-vite/default-ts`, `svelte-vite/default-ts`,
-`angular-cli/default-ts`, `nextjs/default-ts`.
+`angular-cli/default-ts`, `nextjs/default-ts`,
+`nextjs-vite/default-ts`.
+
+### Triage rule for nextjs vs nextjs-vite (HARD GATE)
+
+`code/frameworks/nextjs/` (webpack-based) and `code/frameworks/nextjs-vite/`
+(Vite-based) are **separate packages** with **incompatible builders**.
+A spec that targets `sandbox:nextjs/default-ts` for a diff that only touches
+`code/frameworks/nextjs-vite/**` will compile-fail mid-boot inside Webpack
+and produce a misleading regression verdict.
+
+Before emitting the spec target:
+
+1. If **any** changed path matches `code/frameworks/nextjs-vite/**`, the
+   target MUST be `sandbox:nextjs-vite/default-ts`. The Vite framework
+   has its own builder pipeline, runtime shims, and `next/*` mocks that
+   the webpack framework does not exercise.
+2. If **only** `code/frameworks/nextjs/**` paths change (webpack-only),
+   the target is `sandbox:nextjs/default-ts`.
+3. If both change, prefer `sandbox:nextjs-vite/default-ts` (it is the
+   forward-going framework) and call out the dual-touch in the diff
+   coverage comment.
 
 The header must appear before the first `import` statement. The
 parser scans the first 30 lines; an absent or unrecognised header

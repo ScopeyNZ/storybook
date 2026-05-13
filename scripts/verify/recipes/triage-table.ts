@@ -93,7 +93,13 @@ export const TRIAGE_ROUTES: ReadonlyArray<TriageRoute> = [
   {
     pathGlob: 'code/frameworks/nextjs/**',
     referenceSpecs: ['framework-nextjs.spec.ts'],
-    rationale: 'Next.js framework boot + render, including next/image and routing shims.',
+    rationale: 'Next.js (webpack) framework boot + render, including next/image and routing shims.',
+  },
+  {
+    pathGlob: 'code/frameworks/nextjs-vite/**',
+    referenceSpecs: ['framework-nextjs.spec.ts'],
+    rationale:
+      'Next.js (Vite) framework boot + render. Distinct from code/frameworks/nextjs/** (webpack) — must run on sandbox:nextjs-vite/default-ts, never on sandbox:nextjs/default-ts.',
   },
   {
     pathGlob: 'code/frameworks/vue3-vite/**',
